@@ -1607,5 +1607,759 @@ print("\n✅ All final outputs copied to Google Drive:")
 print(DRIVE_OUT_DIR)
 
 print("\n✅ Multi-year CatBoost training NPZ construction complete.")
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Final NPZ reliability audit
+# For:
+# ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz
+# ============================================================
+
+import os
+import re
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Paths
+# ============================================================
+
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+CITY_INFO = "/content/drive/MyDrive/anature_revised/selected_cities_fullinfo_with_koppen.xlsx"
+
+QC_DIR = "/content/drive/MyDrive/anature_revised/final_npz_reliability_audit"
+os.makedirs(QC_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+SAMPLE_N = 300_000
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 140,
+    "savefig.dpi": 400,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def norm_city(x):
+    return re.sub(r"[^a-z0-9]", "", str(x).lower())
+
+def extract_koppen_code(x):
+    s = str(x).strip()
+    m = re.search(
+        r"\b(Af|Am|Aw|As|BWh|BWk|BSh|BSk|Csa|Csb|Csc|Cwa|Cwb|Cwc|Cfa|Cfb|Cfc|"
+        r"Dsa|Dsb|Dsc|Dsd|Dwa|Dwb|Dwc|Dwd|Dfa|Dfb|Dfc|Dfd|ET|EF)\b",
+        s
+    )
+    return m.group(1) if m else None
+
+def find_best_city_col(meta, npz_city_names):
+    keys_npz = set(norm_city(c) for c in npz_city_names)
+    best_col, best_n = None, -1
+    for c in meta.columns:
+        keys = set(norm_city(v) for v in meta[c].dropna().astype(str).unique())
+        n = len(keys_npz & keys)
+        if n > best_n:
+            best_col, best_n = c, n
+    return best_col, best_n
+
+def find_best_koppen_col(meta):
+    best_col, best_n = None, -1
+    for c in meta.columns:
+        vals = meta[c].dropna().astype(str).head(1000)
+        n = vals.apply(extract_koppen_code).notna().sum()
+        if n > best_n:
+            best_col, best_n = c, n
+    return best_col, best_n
+
+def pctl(x, q):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan
+    return float(np.nanpercentile(x, q))
+
+def safe_corr(a, b):
+    a = np.asarray(a, float)
+    b = np.asarray(b, float)
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < 100:
+        return np.nan
+    return float(np.corrcoef(a[m], b[m])[0, 1])
+
+def saturation_vapor_pressure_kpa(Tc):
+    # Tetens formula, T in Celsius
+    return 0.6108 * np.exp((17.27 * Tc) / (Tc + 237.3))
+
+def month_peak(series_by_month):
+    s = np.asarray(series_by_month, float)
+    if np.isfinite(s).sum() == 0:
+        return np.nan
+    return int(np.nanargmax(s) + 1)
+
+def savefig(name):
+    plt.tight_layout()
+    plt.savefig(os.path.join(QC_DIR, name + ".png"), bbox_inches="tight")
+    plt.savefig(os.path.join(QC_DIR, name + ".pdf"), bbox_inches="tight")
+    plt.show()
+
+# ============================================================
+# 2. Load NPZ
+# ============================================================
+
+print("Loading:", NPZ_PATH)
+data = np.load(NPZ_PATH, allow_pickle=True)
+
+print("\nNPZ keys:")
+print(data.files)
+
+X = data["X"].astype(np.float32)
+y = data["y"].astype(np.float32)
+channels = data["channels"].astype(object).tolist()
+feat = {c: i for i, c in enumerate(channels)}
+
+print("\nShape:")
+print("X:", X.shape)
+print("y:", y.shape)
+print("channels:", len(channels))
+
+print("\nChannels:")
+for i, ch in enumerate(channels):
+    print(f"{i:02d}: {ch}")
+
+# ============================================================
+# 3. Structural completeness
+# ============================================================
+
+meta_keys = [
+    "sample_city_id", "sample_city_name", "sample_year", "sample_month",
+    "sample_yyyymm", "sample_row", "sample_col", "sample_lon", "sample_lat",
+    "sample_era_row", "sample_era_col", "sample_spatial_block_id"
+]
+
+structure_rows = []
+n = X.shape[0]
+
+structure_rows.append(["X rows", n, "OK"])
+structure_rows.append(["y length", len(y), "OK" if len(y) == n else "FAIL"])
+
+for k in meta_keys:
+    if k in data.files:
+        status = "OK" if len(data[k]) == n else "FAIL"
+        structure_rows.append([k, len(data[k]), status])
+    else:
+        structure_rows.append([k, np.nan, "MISSING"])
+
+df_structure = pd.DataFrame(structure_rows, columns=["item", "length_or_value", "status"])
+df_structure.to_csv(os.path.join(QC_DIR, "01_structure_check.csv"), index=False)
+
+print("\n===== Structure check =====")
+print(df_structure.to_string(index=False))
+
+# ============================================================
+# 4. Metadata coverage
+# ============================================================
+
+year = data["sample_year"].astype(int)
+month = data["sample_month"].astype(int)
+city = data["sample_city_name"].astype(str)
+city_id = data["sample_city_id"].astype(int)
+lat = data["sample_lat"].astype(float)
+lon = data["sample_lon"].astype(float)
+
+coverage_summary = {
+    "n_samples": int(n),
+    "n_features_in_X": int(X.shape[1]),
+    "n_channels": int(len(channels)),
+    "n_cities": int(len(np.unique(city))),
+    "n_city_ids": int(len(np.unique(city_id))),
+    "year_min": int(np.min(year)),
+    "year_max": int(np.max(year)),
+    "n_years": int(len(np.unique(year))),
+    "months": sorted(np.unique(month).astype(int).tolist()),
+    "lat_min": float(np.nanmin(lat)),
+    "lat_max": float(np.nanmax(lat)),
+    "lon_min": float(np.nanmin(lon)),
+    "lon_max": float(np.nanmax(lon)),
+    "north_samples": int(np.sum(lat > 0)),
+    "south_samples": int(np.sum(lat < 0)),
+}
+
+with open(os.path.join(QC_DIR, "02_coverage_summary.json"), "w") as f:
+    json.dump(coverage_summary, f, indent=2)
+
+print("\n===== Coverage summary =====")
+print(json.dumps(coverage_summary, indent=2))
+
+# year/month/city counts
+pd.Series(year).value_counts().sort_index().rename("n_samples").to_csv(
+    os.path.join(QC_DIR, "03_year_counts.csv")
+)
+
+pd.Series(month).value_counts().sort_index().rename("n_samples").to_csv(
+    os.path.join(QC_DIR, "04_month_counts.csv")
+)
+
+pd.Series(city).value_counts().rename("n_samples").to_csv(
+    os.path.join(QC_DIR, "05_city_counts.csv")
+)
+
+# city-year-month coverage
+df_meta_small = pd.DataFrame({
+    "city": city,
+    "city_id": city_id,
+    "year": year,
+    "month": month,
+    "lat": lat,
+    "lon": lon,
+})
+
+city_year_month = (
+    df_meta_small.groupby(["city", "year"])["month"]
+    .nunique()
+    .reset_index(name="n_months")
+)
+
+city_year_month.to_csv(os.path.join(QC_DIR, "06_city_year_month_coverage.csv"), index=False)
+
+print("\nCity-year month coverage:")
+print(city_year_month["n_months"].describe())
+
+# check yyyymm consistency
+yyyymm_ok = True
+if "sample_yyyymm" in data.files:
+    yy = data["sample_yyyymm"].astype(str)
+    yy_calc = np.array([f"{int(a):04d}{int(b):02d}" for a, b in zip(year, month)])
+    yyyymm_ok = bool(np.all(yy == yy_calc))
+    print("sample_yyyymm consistency:", yyyymm_ok)
+
+# ============================================================
+# 5. Variable completeness and distribution
+# ============================================================
+
+summary_rows = []
+
+for ch in channels:
+    vals = X[:, feat[ch]]
+    finite = np.isfinite(vals)
+
+    row = {
+        "channel": ch,
+        "finite_rate": float(finite.mean()),
+        "missing_rate": float(1 - finite.mean()),
+        "mean": float(np.nanmean(vals)),
+        "std": float(np.nanstd(vals)),
+        "min": float(np.nanmin(vals)),
+        "p01": pctl(vals, 1),
+        "p05": pctl(vals, 5),
+        "p50": pctl(vals, 50),
+        "p95": pctl(vals, 95),
+        "p99": pctl(vals, 99),
+        "max": float(np.nanmax(vals)),
+    }
+    summary_rows.append(row)
+
+# target y
+summary_rows.append({
+    "channel": "TARGET_y_LST",
+    "finite_rate": float(np.isfinite(y).mean()),
+    "missing_rate": float(1 - np.isfinite(y).mean()),
+    "mean": float(np.nanmean(y)),
+    "std": float(np.nanstd(y)),
+    "min": float(np.nanmin(y)),
+    "p01": pctl(y, 1),
+    "p05": pctl(y, 5),
+    "p50": pctl(y, 50),
+    "p95": pctl(y, 95),
+    "p99": pctl(y, 99),
+    "max": float(np.nanmax(y)),
+})
+
+df_var = pd.DataFrame(summary_rows)
+df_var.to_csv(os.path.join(QC_DIR, "07_variable_distribution_summary.csv"), index=False)
+
+print("\n===== Variable distribution summary =====")
+print(df_var.to_string(index=False))
+
+# ============================================================
+# 6. Expected range / physical sanity flags
+# ============================================================
+
+range_rules = {
+    "DEM.DEM": (-500, 9000),
+    "ERA5LMAIN.SSRD": (0, 500),
+    "ERA5LMAIN.STL1": (-80, 80),
+    "ERA5LMAIN.SWVL1": (0, 1),
+    "ERA5LMAIN.T2M": (-80, 80),
+    "ERA5LMAIN.TD": (-100, 80),
+    "ERA5LMAIN.TP": (0, 2000),
+    "ERA5LMAIN.VPD": (0, 15),
+    "ERA5LMAIN.WIND10M": (0, 50),
+    "EVI.EVI": (-0.1, 1.0),
+    "LAI.LAI": (0, 10),
+    "MODIS.LC": (0, 20),
+    "NTL.NTL": (0, 2000),
+    "TARGET_y_LST": (-80, 80),
+}
+
+flag_rows = []
+
+for ch, (lo, hi) in range_rules.items():
+    vals = y if ch == "TARGET_y_LST" else X[:, feat[ch]]
+    finite = np.isfinite(vals)
+    bad_low = np.sum(vals[finite] < lo)
+    bad_high = np.sum(vals[finite] > hi)
+    rate_bad = (bad_low + bad_high) / max(1, finite.sum())
+
+    flag_rows.append({
+        "variable": ch,
+        "expected_min": lo,
+        "expected_max": hi,
+        "n_finite": int(finite.sum()),
+        "n_below": int(bad_low),
+        "n_above": int(bad_high),
+        "bad_rate": float(rate_bad),
+        "status": "OK" if rate_bad < 0.001 else "CHECK"
+    })
+
+df_flags = pd.DataFrame(flag_rows)
+df_flags.to_csv(os.path.join(QC_DIR, "08_expected_range_flags.csv"), index=False)
+
+print("\n===== Expected range flags =====")
+print(df_flags.to_string(index=False))
+
+# ============================================================
+# 7. Biophysical sanity checks
+# ============================================================
+
+def col(ch):
+    return X[:, feat[ch]]
+
+bio = {}
+
+# Basic physical signs
+bio["VPD_negative_rate"] = float(np.mean(col("ERA5LMAIN.VPD") < 0))
+bio["TP_negative_rate"] = float(np.mean(col("ERA5LMAIN.TP") < 0))
+bio["WIND_negative_rate"] = float(np.mean(col("ERA5LMAIN.WIND10M") < 0))
+bio["SWVL1_outside_0_1_rate"] = float(np.mean((col("ERA5LMAIN.SWVL1") < 0) | (col("ERA5LMAIN.SWVL1") > 1)))
+
+# Dew point should usually be <= air temperature
+t2m = col("ERA5LMAIN.T2M")
+td = col("ERA5LMAIN.TD")
+bio["TD_greater_than_T2M_rate"] = float(np.mean(td > t2m + 0.1))
+
+# VPD formula consistency, approximate
+vpd = col("ERA5LMAIN.VPD")
+vpd_calc = saturation_vapor_pressure_kpa(t2m) - saturation_vapor_pressure_kpa(td)
+vpd_calc = np.maximum(vpd_calc, 0)
+
+m_vpd = np.isfinite(vpd) & np.isfinite(vpd_calc)
+bio["VPD_formula_corr"] = safe_corr(vpd[m_vpd], vpd_calc[m_vpd])
+bio["VPD_formula_median_abs_diff"] = float(np.nanmedian(np.abs(vpd[m_vpd] - vpd_calc[m_vpd])))
+
+# Ecological / thermal relationships
+bio["corr_EVI_LAI"] = safe_corr(col("EVI.EVI"), col("LAI.LAI"))
+bio["corr_LST_T2M"] = safe_corr(y, t2m)
+bio["corr_LST_SSRD"] = safe_corr(y, col("ERA5LMAIN.SSRD"))
+bio["corr_LST_VPD"] = safe_corr(y, col("ERA5LMAIN.VPD"))
+bio["corr_SWVL1_VPD"] = safe_corr(col("ERA5LMAIN.SWVL1"), col("ERA5LMAIN.VPD"))
+bio["corr_EVI_LST"] = safe_corr(col("EVI.EVI"), y)
+bio["corr_LAI_LST"] = safe_corr(col("LAI.LAI"), y)
+
+with open(os.path.join(QC_DIR, "09_biophysical_sanity_checks.json"), "w") as f:
+    json.dump(bio, f, indent=2)
+
+print("\n===== Biophysical sanity checks =====")
+print(json.dumps(bio, indent=2))
+
+# ============================================================
+# 8. Model-input consistency check
+# ============================================================
+
+final_model_features = [
+    "DEM.DEM",
+    "ERA5LMAIN.SSRD",
+    "ERA5LMAIN.SWVL1",
+    "ERA5LMAIN.TP",
+    "ERA5LMAIN.VPD",
+    "ERA5LMAIN.WIND10M",
+    "EVI.EVI",
+    "LAI.LAI",
+    "MODIS.LC",
+    "NTL.NTL",
+]
+
+excluded_features = [
+    "ERA5LMAIN.STL1",
+    "ERA5LMAIN.T2M",
+    "ERA5LMAIN.TD",
+    "META.CITY_ID",
+]
+
+model_rows = []
+
+for ch in final_model_features:
+    model_rows.append({
+        "feature": ch,
+        "expected_role": "used_in_final_model",
+        "present_in_NPZ": ch in channels,
+        "finite_rate": float(np.isfinite(X[:, feat[ch]]).mean()) if ch in channels else np.nan,
+    })
+
+for ch in excluded_features:
+    model_rows.append({
+        "feature": ch,
+        "expected_role": "excluded_from_final_model",
+        "present_in_NPZ": ch in channels,
+        "finite_rate": float(np.isfinite(X[:, feat[ch]]).mean()) if ch in channels else np.nan,
+    })
+
+df_model = pd.DataFrame(model_rows)
+df_model.to_csv(os.path.join(QC_DIR, "10_model_input_consistency.csv"), index=False)
+
+print("\n===== Model input consistency =====")
+print(df_model.to_string(index=False))
+
+# ============================================================
+# 9. Köppen / hemisphere labels
+# ============================================================
+
+clim = np.array(["UNK"] * n, dtype=object)
+
+if os.path.exists(CITY_INFO):
+    meta = pd.read_excel(CITY_INFO)
+    city_col, city_match = find_best_city_col(meta, np.unique(city))
+    kop_col, kop_score = find_best_koppen_col(meta)
+
+    print("\nCITY_INFO columns:", meta.columns.tolist())
+    print("Selected city column:", city_col, "matched cities:", city_match)
+    print("Selected Köppen column:", kop_col, "valid code rows:", kop_score)
+
+    meta2 = meta[[city_col, kop_col]].copy()
+    meta2.columns = ["city", "koppen_raw"]
+    meta2["key"] = meta2["city"].apply(norm_city)
+    meta2["koppen_code"] = meta2["koppen_raw"].apply(extract_koppen_code)
+    meta2["clim_major"] = meta2["koppen_code"].astype(str).str[0].str.upper()
+    meta2.loc[~meta2["clim_major"].isin(["A", "B", "C", "D", "E"]), "clim_major"] = "UNK"
+
+    city2clim = dict(zip(meta2["key"], meta2["clim_major"]))
+    sample_key = np.array([norm_city(c) for c in city], object)
+    clim = np.array([city2clim.get(k, "UNK") for k in sample_key], object)
+
+pd.Series(clim).value_counts().rename("n_samples").to_csv(
+    os.path.join(QC_DIR, "11_koppen_major_counts.csv")
+)
+
+print("\nKöppen major counts:")
+print(pd.Series(clim).value_counts())
+
+# ============================================================
+# 10. Seasonal diagnostics
+# ============================================================
+
+df_season = pd.DataFrame({
+    "year": year,
+    "month": month,
+    "city": city,
+    "lat": lat,
+    "lon": lon,
+    "hemisphere": np.where(lat >= 0, "NH", "SH"),
+    "clim_major": clim,
+    "LST": y,
+    "EVI": col("EVI.EVI"),
+    "LAI": col("LAI.LAI"),
+    "T2M": col("ERA5LMAIN.T2M"),
+    "TD": col("ERA5LMAIN.TD"),
+    "VPD": col("ERA5LMAIN.VPD"),
+    "SSRD": col("ERA5LMAIN.SSRD"),
+    "TP": col("ERA5LMAIN.TP"),
+    "SWVL1": col("ERA5LMAIN.SWVL1"),
+    "WIND10M": col("ERA5LMAIN.WIND10M"),
+    "STL1": col("ERA5LMAIN.STL1"),
+    "DEM": col("DEM.DEM"),
+    "NTL": col("NTL.NTL"),
+})
+
+# Monthly means by hemisphere
+season_hemi = (
+    df_season.groupby(["hemisphere", "month"])[
+        ["LST", "EVI", "LAI", "T2M", "VPD", "SSRD", "TP", "SWVL1", "WIND10M"]
+    ]
+    .mean()
+    .reset_index()
+)
+
+season_hemi.to_csv(os.path.join(QC_DIR, "12_monthly_means_by_hemisphere.csv"), index=False)
+
+# Monthly means by Köppen major
+season_clim = (
+    df_season[df_season["clim_major"].isin(["A", "B", "C", "D"])]
+    .groupby(["clim_major", "month"])[
+        ["LST", "EVI", "LAI", "T2M", "VPD", "SSRD", "TP", "SWVL1", "WIND10M"]
+    ]
+    .mean()
+    .reset_index()
+)
+
+season_clim.to_csv(os.path.join(QC_DIR, "13_monthly_means_by_koppen_major.csv"), index=False)
+
+# Peak month diagnostics
+peak_rows = []
+
+for group_name, group_col in [("hemisphere", "hemisphere"), ("clim_major", "clim_major")]:
+    for g, sub in df_season.groupby(group_col):
+        if g == "UNK":
+            continue
+        mm = sub.groupby("month")[["LST", "EVI", "LAI", "T2M", "VPD", "SSRD", "SWVL1"]].mean()
+        row = {"group_type": group_name, "group": g, "n_samples": int(len(sub))}
+        for v in mm.columns:
+            row[f"{v}_peak_month"] = month_peak(mm[v].values)
+            row[f"{v}_min_month"] = int(np.nanargmin(mm[v].values) + 1)
+        peak_rows.append(row)
+
+df_peak = pd.DataFrame(peak_rows)
+df_peak.to_csv(os.path.join(QC_DIR, "14_peak_month_diagnostics.csv"), index=False)
+
+print("\nPeak month diagnostics:")
+print(df_peak.to_string(index=False))
+
+# ============================================================
+# 11. Plots: coverage
+# ============================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
+
+pd.Series(year).value_counts().sort_index().plot(kind="bar", ax=axes[0])
+axes[0].set_title("Samples by year")
+axes[0].set_xlabel("Year")
+axes[0].set_ylabel("n samples")
+
+pd.Series(month).value_counts().sort_index().plot(kind="bar", ax=axes[1])
+axes[1].set_title("Samples by month")
+axes[1].set_xlabel("Month")
+axes[1].set_ylabel("n samples")
+
+savefig("15_sample_counts_year_month")
+
+# ============================================================
+# 12. Plots: seasonal curves by hemisphere
+# ============================================================
+
+vars_to_plot = ["LST", "EVI", "LAI", "T2M", "VPD", "SSRD", "TP", "SWVL1"]
+
+fig, axes = plt.subplots(4, 2, figsize=(10, 12))
+axes = axes.ravel()
+
+for ax, v in zip(axes, vars_to_plot):
+    for hemi in ["NH", "SH"]:
+        sub = season_hemi[season_hemi["hemisphere"] == hemi]
+        if len(sub) == 0:
+            continue
+        ax.plot(sub["month"], sub[v], marker="o", label=hemi)
+    ax.set_title(v)
+    ax.set_xlabel("Month")
+    ax.grid(True, linestyle=":", alpha=0.3)
+    ax.legend(frameon=False)
+
+savefig("16_seasonal_curves_by_hemisphere")
+
+# ============================================================
+# 13. Plots: seasonal curves by Köppen major
+# ============================================================
+
+fig, axes = plt.subplots(3, 2, figsize=(11, 10))
+axes = axes.ravel()
+
+for ax, v in zip(axes, ["LST", "EVI", "LAI", "VPD", "SSRD", "SWVL1"]):
+    for c in ["A", "B", "C", "D"]:
+        sub = season_clim[season_clim["clim_major"] == c]
+        if len(sub) == 0:
+            continue
+        ax.plot(sub["month"], sub[v], marker="o", label=c)
+    ax.set_title(v + " by Köppen major")
+    ax.set_xlabel("Month")
+    ax.grid(True, linestyle=":", alpha=0.3)
+    ax.legend(frameon=False)
+
+savefig("17_seasonal_curves_by_koppen_major")
+
+# ============================================================
+# 14. Correlation diagnostics on sample
+# ============================================================
+
+rng = np.random.default_rng(RANDOM_SEED)
+idx = rng.choice(n, size=min(SAMPLE_N, n), replace=False)
+
+corr_cols = [
+    "LST", "EVI", "LAI", "T2M", "TD", "VPD", "SSRD", "TP",
+    "SWVL1", "WIND10M", "STL1", "DEM", "NTL"
+]
+
+df_sample = df_season.iloc[idx][corr_cols].copy()
+corr = df_sample.corr(method="spearman")
+corr.to_csv(os.path.join(QC_DIR, "18_spearman_correlation_sample.csv"))
+
+plt.figure(figsize=(8, 7))
+plt.imshow(corr.values, vmin=-1, vmax=1)
+plt.colorbar(label="Spearman correlation")
+plt.xticks(range(len(corr_cols)), corr_cols, rotation=90)
+plt.yticks(range(len(corr_cols)), corr_cols)
+plt.title("Spearman correlation, random sample")
+savefig("18_spearman_correlation_heatmap")
+
+# ============================================================
+# 15. Scatter diagnostics
+# ============================================================
+
+idx2 = rng.choice(n, size=min(80_000, n), replace=False)
+
+fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+
+axes[0, 0].scatter(t2m[idx2], y[idx2], s=1, alpha=0.12)
+axes[0, 0].set_xlabel("T2M (°C)")
+axes[0, 0].set_ylabel("LST target (°C)")
+axes[0, 0].set_title("LST vs T2M")
+
+axes[0, 1].scatter(col("EVI.EVI")[idx2], col("LAI.LAI")[idx2], s=1, alpha=0.12)
+axes[0, 1].set_xlabel("EVI")
+axes[0, 1].set_ylabel("LAI")
+axes[0, 1].set_title("EVI vs LAI")
+
+axes[1, 0].scatter(col("ERA5LMAIN.VPD")[idx2], y[idx2], s=1, alpha=0.12)
+axes[1, 0].set_xlabel("VPD (kPa)")
+axes[1, 0].set_ylabel("LST target (°C)")
+axes[1, 0].set_title("LST vs VPD")
+
+axes[1, 1].scatter(col("ERA5LMAIN.SWVL1")[idx2], col("ERA5LMAIN.VPD")[idx2], s=1, alpha=0.12)
+axes[1, 1].set_xlabel("SWVL1")
+axes[1, 1].set_ylabel("VPD")
+axes[1, 1].set_title("VPD vs soil moisture")
+
+for ax in axes.ravel():
+    ax.grid(True, linestyle=":", alpha=0.25)
+
+savefig("19_scatter_physical_relationships")
+
+# ============================================================
+# 16. Spatial diagnostic sample
+# ============================================================
+
+idx3 = rng.choice(n, size=min(120_000, n), replace=False)
+
+plt.figure(figsize=(8, 4.2))
+plt.scatter(lon[idx3], lat[idx3], c=y[idx3], s=1, alpha=0.35)
+plt.colorbar(label="LST target (°C)")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.title("Spatial sample colored by LST target")
+plt.grid(True, linestyle=":", alpha=0.25)
+savefig("20_spatial_sample_LST")
+
+plt.figure(figsize=(8, 4.2))
+plt.scatter(lon[idx3], lat[idx3], c=col("EVI.EVI")[idx3], s=1, alpha=0.35)
+plt.colorbar(label="EVI")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.title("Spatial sample colored by EVI")
+plt.grid(True, linestyle=":", alpha=0.25)
+savefig("21_spatial_sample_EVI")
+
+# ============================================================
+# 17. Final reliability scorecard
+# ============================================================
+
+scorecard = []
+
+def add_score(item, passed, detail):
+    scorecard.append({
+        "item": item,
+        "status": "PASS" if passed else "CHECK",
+        "detail": detail
+    })
+
+add_score(
+    "Years cover 2013-2025",
+    coverage_summary["year_min"] == 2013 and coverage_summary["year_max"] == 2025 and coverage_summary["n_years"] == 13,
+    f"{coverage_summary['year_min']}-{coverage_summary['year_max']}, n={coverage_summary['n_years']}"
+)
+
+add_score(
+    "All 12 months present",
+    coverage_summary["months"] == list(range(1, 13)),
+    str(coverage_summary["months"])
+)
+
+add_score(
+    "100 cities present",
+    coverage_summary["n_cities"] == 100,
+    f"n_cities={coverage_summary['n_cities']}"
+)
+
+add_score(
+    "Required final model predictors present",
+    all(ch in channels for ch in final_model_features),
+    ", ".join([ch for ch in final_model_features if ch not in channels]) or "all present"
+)
+
+add_score(
+    "Final model predictors finite",
+    all(np.isfinite(X[:, feat[ch]]).mean() > 0.99 for ch in final_model_features),
+    "finite rates checked"
+)
+
+add_score(
+    "VPD non-negative",
+    bio["VPD_negative_rate"] < 1e-6,
+    f"negative rate={bio['VPD_negative_rate']:.6f}"
+)
+
+add_score(
+    "TD mostly <= T2M",
+    bio["TD_greater_than_T2M_rate"] < 0.01,
+    f"TD>T2M rate={bio['TD_greater_than_T2M_rate']:.6f}"
+)
+
+add_score(
+    "EVI-LAI positive relationship",
+    bio["corr_EVI_LAI"] > 0.4,
+    f"corr={bio['corr_EVI_LAI']:.3f}"
+)
+
+add_score(
+    "LST-T2M positive relationship",
+    bio["corr_LST_T2M"] > 0.5,
+    f"corr={bio['corr_LST_T2M']:.3f}"
+)
+
+add_score(
+    "SWVL1 within physical range",
+    bio["SWVL1_outside_0_1_rate"] < 1e-6,
+    f"outside rate={bio['SWVL1_outside_0_1_rate']:.6f}"
+)
+
+add_score(
+    "VPD formula consistency",
+    bio["VPD_formula_corr"] > 0.8,
+    f"corr={bio['VPD_formula_corr']:.3f}, median abs diff={bio['VPD_formula_median_abs_diff']:.3f}"
+)
+
+df_score = pd.DataFrame(scorecard)
+df_score.to_csv(os.path.join(QC_DIR, "22_final_reliability_scorecard.csv"), index=False)
+
+print("\n===== Final reliability scorecard =====")
+print(df_score.to_string(index=False))
+
+print("\nAll QC outputs saved to:")
+print(QC_DIR)
 print("\nFinal NPZ:")
 print(os.path.join(DRIVE_OUT_DIR, os.path.basename(OUT_NPZ)))
