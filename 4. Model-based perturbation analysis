@@ -1,0 +1,210 @@
+
+# !pip -q install catboost
+import os, json, numpy as np, pandas as pd
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+
+MODEL_DIR = "/content/GZ_model_20251117_033702"  # ← Replace with your directory
+
+model_path     = os.path.join(MODEL_DIR, "catboost_model.cbm")
+channels_path  = os.path.join(MODEL_DIR, "channels.npy")
+X_valid_path   = os.path.join(MODEL_DIR, "X_valid.npy")
+y_valid_path   = os.path.join(MODEL_DIR, "y_valid.npy")
+
+assert os.path.exists(model_path), f"Model not found: {model_path}"
+assert os.path.exists(channels_path), f"Feature file not found:{channels_path}"
+assert os.path.exists(X_valid_path) and os.path.exists(y_valid_path), "The validation set file is missing."
+
+# ================== Loading Models and Data ==================
+model    = CatBoostRegressor()
+model.load_model(model_path)
+channels = np.load(channels_path, allow_pickle=True).astype(object).tolist()
+X_valid  = np.load(X_valid_path)
+y_valid  = np.load(y_valid_path).astype(np.float32)
+Xv = pd.DataFrame(X_valid, columns=channels)
+
+# Analyse only EVI / LAI
+veg_features = [f for f in ["EVI.EVI", "LAI.LAI"] if f in Xv.columns]
+assert veg_features, f"The validation set does not contain EVI.EVI/LAI.LAI, which are listed in:{Xv.columns.tolist()}"
+
+# ================== Clean-up: EVI/LAI negative values → 0, and upper bound clipping ==================
+def sanitize_veg(df: pd.DataFrame):
+    if "EVI.EVI" in df.columns:
+        x = df["EVI.EVI"].to_numpy(copy=True)
+        x[~np.isfinite(x)] = np.nan
+        x = np.nan_to_num(x, nan=0.0)
+        x = np.clip(x, 0.0, 1.0) 
+        df["EVI.EVI"] = x
+    if "LAI.LAI" in df.columns:
+        x = df["LAI.LAI"].to_numpy(copy=True)
+        x[~np.isfinite(x)] = np.nan
+        x = np.nan_to_num(x, nan=0.0)
+        x = np.clip(x, 0.0, 8.0) 
+        df["LAI.LAI"] = x
+    return df
+
+Xv = sanitize_veg(Xv)
+
+# ================== Quantile Partitioning (High Temperature/Medium Temperature) ==================
+q80 = np.quantile(y_valid, 0.80)
+q60 = np.quantile(y_valid, 0.60)
+idx_all  = np.ones_like(y_valid, dtype=bool)
+idx_high = y_valid >= q80
+idx_mid  = (y_valid < q80) & (y_valid >= q60)
+
+subsets = {
+    "All":  idx_all,
+    "High Temp (≥P80)": idx_high,
+    "Mid Temp ([P60,P80))": idx_mid
+}
+
+# ================== Utility Functions ==================
+def clip_feature(name, arr):
+   
+    if name == "EVI.EVI":
+        return np.clip(arr, 0.0, 1.0)
+    if name == "LAI.LAI":
+        return np.clip(arr, 0.0, 8.0)
+    return arr
+
+def positive_deltas_by_1pct_steps(x_series, hi=0.95, pct_step=0.001, max_points=201):
+‘’‘
+Positive perturbations only: Δ starts from 0, incrementing by 1%*mean_pos until reaching (Q95 - mean_pos).
+- mean_pos: Calculates mean only for samples where x > 0
+- If the range is too small, fall back to a very small positive range
+’‘’
+    x = x_series.to_numpy()
+    pos_mask = np.isfinite(x) & (x > 0)
+    if pos_mask.sum() == 0:
+       # All non-positive/missing, return minimal perturbation
+        return np.array([0.0, 1e-3], dtype=float)
+
+    mean_pos = float(np.mean(x[pos_mask]))
+    q_hi     = float(np.quantile(x[pos_mask], hi))
+    max_inc  = max(0.0, 4)
+
+    step = max(1e-6, pct_step * max(mean_pos, 1e-6))  # 1%*mean_pos
+    if max_inc < step:  
+        return np.array([0.0, max(1e-4, max_inc)], dtype=float)
+
+
+    n_steps = int(np.floor(max_inc / step)) + 1
+    n_steps = min(n_steps, max_points)
+    deltas = np.linspace(0.0, step*(n_steps-1), n_steps, dtype=float)
+    return deltas
+
+def perturb_and_response_positive(model, X_df, y_base, feat, deltas):
+
+   
+    if feat not in X_df.columns:
+        return np.array([], dtype=float)
+    base_mask = np.isfinite(X_df[feat].to_numpy()) & (X_df[feat].to_numpy() > 0)
+    if not base_mask.any():
+        return np.array([], dtype=float)
+
+    X_sub = X_df.loc[base_mask]
+    y_sub = y_base[base_mask]
+    base  = float(np.nanmean(y_sub)) if y_sub.size else np.nan
+
+    res = []
+    for d in deltas:
+        X_mod = X_sub.copy()
+        X_mod[feat] = clip_feature(feat, X_mod[feat].to_numpy() + d)
+        y_pred = model.predict(X_mod.to_numpy())
+        res.append(float(np.nanmean(y_pred) - base))
+    return np.array(res, dtype=float)
+
+def summarize_curve(deltas, response):
+    """
+Abstract Metrics (Forward Disturbance):
+- min_cooling: Maximum cooling (lower negative values are preferable), and corresponding Δ
+- sat80_delta: Minimum Δ required to achieve 80% of maximum cooling (approaching threshold/saturation point)
+- Left and right endpoint slopes (here, the right endpoint corresponds to the maximum forward disturbance)
+    """
+    out = {"min_cooling": np.nan, "at_delta": np.nan, "sat80_delta": np.nan,
+           "left_slope": np.nan, "right_slope": np.nan}
+    if response.size == 0 or deltas.size == 0:
+        return out
+
+
+    i_min = int(np.nanargmin(response))
+    out["min_cooling"] = float(response[i_min])
+    out["at_delta"]    = float(deltas[i_min])
+
+    target = 0.8 * response[i_min]
+    sat_idx = np.where(response <= target)[0]
+    if sat_idx.size:
+        nearest = sat_idx[np.argmin(np.abs(deltas[sat_idx]))]
+        out["sat80_delta"] = float(deltas[nearest])
+
+    if deltas.size >= 3:
+        left_slope  = (response[1] - response[0]) / (deltas[1] - deltas[0])
+        right_slope = (response[-1] - response[-2]) / (deltas[-1] - deltas[-2])
+        out["left_slope"]  = float(left_slope)
+        out["right_slope"] = float(right_slope)
+    return out
+
+# ================== Plotting and Measurement ==================
+results = {}  
+
+n = len(veg_features)
+ncols = 2
+nrows = int(np.ceil(n / ncols))
+fig, axes = plt.subplots(nrows, ncols, figsize=(6*ncols, 5*nrows))
+axes = np.atleast_1d(axes).flatten()
+
+for i, feat in enumerate(veg_features):
+    ax = axes[i]
+
+    #Positive disturbanceΔ：0 → Q95−mean_pos，步长=1%*mean_pos
+    deltas = positive_deltas_by_1pct_steps(Xv[feat], hi=0.95, pct_step=0.01, max_points=201)
+
+    curves = {}
+    for name, mask in subsets.items():
+        X_sub = Xv.loc[mask]
+        y_sub = y_valid[mask]
+        resp  = perturb_and_response_positive(model, X_sub, y_sub, feat, deltas)
+        curves[name] = resp
+
+    for name, resp in curves.items():
+        if resp.size:
+            ax.plot(deltas, resp, label=name, linewidth=2 if name=="All" else 1.5)
+
+    ax.axhline(0, color="gray", linestyle=":", linewidth=1)
+    ax.set_title(f"Sensitivity of {feat} (Positive Δ @ 1% steps of mean>0)", fontsize=12)
+    ax.set_xlabel(f"{feat} positive perturbation (Δ ≥ 0)")
+    ax.set_ylabel("Δ Predicted LST (°C)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+# Distribution histogram with this feature overlaid (right axis, showing only values >0)
+    ax2 = ax.twinx()
+    vals = Xv[feat].to_numpy()
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    if vals.size:
+        ax2.hist(vals, bins=30, alpha=0.25, density=True)
+    ax2.set_ylabel("Density", color="gray")
+    ax2.tick_params(axis='y', labelcolor='gray')
+
+    results[feat] = {name: summarize_curve(deltas, resp) for name, resp in curves.items()}
+
+for j in range(i+1, len(axes)):
+    fig.delaxes(axes[j])
+
+plt.suptitle("EVI/LAI Sensitivity (Positive Perturbation, 1% Steps of Mean>0, Range up to Q95-mean)", fontsize=14)
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# ================== Export statistics (for use in papers/tables)==================
+out_json = os.path.join(MODEL_DIR, "veg_sensitivity_positive_1pct.json")
+with open(out_json, "w") as f:
+    json.dump(results, f, indent=2, ensure_ascii=False)
+print("✅ finish：", out_json)
+
+for feat in veg_features:
+    print(f"\n== {feat} ==")
+    for name in ["All", "High Temp (≥P80)", "Mid Temp ([P60,P80))"]:
+        if name in results[feat]:
+            r = results[feat][name]
+            print(f"  [{name}] min_cooling={r['min_cooling']:.3f} °C @ Δ={r['at_delta']:.4f} | sat80Δ={r['sat80_delta']:.4f} | slopes=({r['left_slope']:.3f},{r['right_slope']:.3f})")
