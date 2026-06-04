@@ -1488,3 +1488,726 @@ plt.show()
 
 print("Saved:", OUT_RAW, OUT_CI, OUT_FIG)
 print(df_g[df_g["delta_days"].isin([10, 30])].to_string(index=False))
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Final SI workflow figure consistent with main-text simulation:
+# True NH A/B/C/D + Monte Carlo trajectories + cross-climate aggregation
+#
+# Core algorithm:
+#   1. Use final NPZ and true NH samples.
+#   2. Build typical seasonal library by Köppen A/B/C/D.
+#   3. Generate reduced Monte Carlo trajectories for each climate group.
+#   4. Advance only EVI/LAI in spring green-up window.
+#   5. Keep all background variables fixed.
+#   6. Predict LST with trained CatBoost.
+#   7. Plot workflow + MC baseline samples + aggregated LST response.
+# ============================================================
+
+import os, re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+try:
+    from scipy.signal import savgol_filter
+    HAS_SCIPY = True
+except Exception:
+    HAS_SCIPY = False
+
+
+# ============================================================
+# 0. Paths
+# ============================================================
+
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+CITY_INFO = "/content/drive/MyDrive/anature_revised/selected_cities_fullinfo_with_koppen.xlsx"
+
+MODEL_PATH = "/content/GZ_model_20260604_043639/catboost_model.cbm"
+CHANNELS_NPY = "/content/GZ_model_20260604_043639/channels.npy"
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised/SI_workflow_NH_MC_consistent"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+OUT_FIG = os.path.join(OUT_DIR, "FigS_workflow_NH_ABCD_MC_consistent.png")
+OUT_PDF = OUT_FIG.replace(".png", ".pdf")
+OUT_TABLE = os.path.join(OUT_DIR, "workflow_NH_ABCD_MC_metric_summary.csv")
+OUT_RAW = os.path.join(OUT_DIR, "workflow_NH_ABCD_MC_raw.csv")
+
+
+# ============================================================
+# 1. Settings
+# ============================================================
+
+T = 46
+DT = 8.0
+
+GREENUP_DOY = (60, 180)
+WARM_DOY = (160, 240)
+ADVANCE_LIST = [10, 30]
+
+# 数据量少一点：正式正文可 600，这里 SI workflow 用 50/80/100 都可以
+N_MC_PER_CLIM = 80
+
+SEED = 42
+AR1_RHO = 0.90
+NOISE_SCALE = 0.55
+
+CLIM_ORDER = ["A", "B", "C", "D"]
+
+VEG_CH = ["EVI.EVI", "LAI.LAI"]
+
+MODEL_VAR_MAP = {
+    "DEM": "DEM.DEM",
+    "NTL": "NTL.NTL",
+    "LC": "MODIS.LC",
+    "EVI": "EVI.EVI",
+    "LAI": "LAI.LAI",
+    "ERA5_SSRD": "ERA5LMAIN.SSRD",
+    "ERA5_TP": "ERA5LMAIN.TP",
+    "ERA5_SWVL1": "ERA5LMAIN.SWVL1",
+    "ERA5_VPD": "ERA5LMAIN.VPD",
+    "ERA5_WIND10M": "ERA5LMAIN.WIND10M",
+}
+
+NPZ_VAR_MAP = {
+    "DEM.DEM": "DEM",
+    "ERA5LMAIN.SSRD": "ERA5_SSRD",
+    "ERA5LMAIN.SWVL1": "ERA5_SWVL1",
+    "ERA5LMAIN.TP": "ERA5_TP",
+    "ERA5LMAIN.VPD": "ERA5_VPD",
+    "ERA5LMAIN.WIND10M": "ERA5_WIND10M",
+    "EVI.EVI": "EVI",
+    "LAI.LAI": "LAI",
+    "MODIS.LC": "LC",
+    "NTL.NTL": "NTL",
+}
+
+NOISE_MULT = {
+    "EVI.EVI": 0.45,
+    "LAI.LAI": 0.40,
+    "ERA5LMAIN.SSRD": 0.12,
+    "ERA5LMAIN.VPD": 0.12,
+    "ERA5LMAIN.TP": 0.10,
+    "ERA5LMAIN.SWVL1": 0.10,
+    "ERA5LMAIN.WIND10M": 0.10,
+    "NTL.NTL": 0.02,
+    "DEM.DEM": 0.00,
+    "MODIS.LC": 0.00,
+}
+
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+def norm_city(x):
+    return re.sub(r"[^a-z0-9]", "", str(x).lower())
+
+def extract_koppen_code(x):
+    s = str(x).strip()
+    m = re.search(
+        r"\b(Af|Am|Aw|As|BWh|BWk|BSh|BSk|Csa|Csb|Csc|Cwa|Cwb|Cwc|Cfa|Cfb|Cfc|"
+        r"Dsa|Dsb|Dsc|Dsd|Dwa|Dwb|Dwc|Dwd|Dfa|Dfb|Dfc|Dfd|ET|EF)\b", s
+    )
+    return m.group(1) if m else None
+
+def find_best_city_col(meta, npz_city_names):
+    keys_npz = set(norm_city(c) for c in npz_city_names)
+    best_col, best_n = None, -1
+    for c in meta.columns:
+        keys = set(norm_city(v) for v in meta[c].dropna().astype(str).unique())
+        n = len(keys_npz & keys)
+        if n > best_n:
+            best_col, best_n = c, n
+    if best_n <= 0:
+        raise RuntimeError("Cannot match city column.")
+    return best_col
+
+def find_best_koppen_col(meta):
+    best_col, best_n = None, -1
+    for c in meta.columns:
+        vals = meta[c].dropna().astype(str).head(500)
+        n = vals.apply(extract_koppen_code).notna().sum()
+        if n > best_n:
+            best_col, best_n = c, n
+    if best_n <= 0:
+        raise RuntimeError("Cannot find Köppen code column.")
+    return best_col
+
+def doys(n=T):
+    return np.arange(n) * DT + DT / 2
+
+def month_doy(m):
+    return {1:15,2:45,3:74,4:105,5:135,6:166,7:196,8:227,9:258,10:288,11:319,12:349}[int(m)]
+
+def interp_month_to_46(months, vals):
+    months = np.asarray(months, int)
+    vals = np.asarray(vals, float)
+    ok = np.isfinite(vals)
+    months, vals = months[ok], vals[ok]
+    if len(vals) == 0:
+        return np.full(T, np.nan)
+    if len(vals) == 1:
+        return np.full(T, vals[0])
+    x = np.array([month_doy(m) for m in months], float)
+    order = np.argsort(x)
+    x, vals = x[order], vals[order]
+    xx = np.r_[x - 365, x, x + 365]
+    yy = np.r_[vals, vals, vals]
+    return np.interp(doys(T), xx, yy)
+
+def smooth_curve(y, window=7, poly=2):
+    y = np.asarray(y, float)
+    if np.isfinite(y).sum() < 3:
+        return y
+    s = pd.Series(y).interpolate(limit_direction="both").values
+    if HAS_SCIPY and len(s) >= window:
+        w = min(window, len(s))
+        if w % 2 == 0:
+            w -= 1
+        if w >= 5:
+            return savgol_filter(s, window_length=w, polyorder=min(poly, w-2), mode="interp")
+    return pd.Series(s).rolling(window, center=True, min_periods=1).mean().values
+
+def normalize01(y):
+    y = np.asarray(y, float)
+    return (y - np.nanmin(y)) / (np.nanmax(y) - np.nanmin(y) + 1e-9)
+
+def ar1_noise(n, sigma, rho=0.9, rng=None):
+    if not np.isfinite(sigma) or sigma <= 0:
+        return np.zeros(n)
+    rng = np.random.default_rng() if rng is None else rng
+    e = rng.normal(size=n)
+    x = np.zeros(n)
+    x[0] = rng.normal(0, sigma)
+    inn = sigma * np.sqrt(max(1e-8, 1 - rho**2))
+    for i in range(1, n):
+        x[i] = rho * x[i-1] + inn * e[i]
+    return x
+
+def shift_window_no_wrap(x, days, win):
+    x = np.asarray(x, float)
+    if days <= 0:
+        return x.copy()
+    d = doys(len(x))
+    idx = np.where((d >= win[0]) & (d <= win[1]))[0]
+    if len(idx) < 3:
+        return x.copy()
+    i0, i1 = idx[0], idx[-1]
+    seg = x[i0:i1+1]
+    s = days / DT
+    k = np.arange(len(seg))
+    src = np.clip(k + s, 0, len(seg)-1)
+    a = np.floor(src).astype(int)
+    b = np.clip(a + 1, 0, len(seg)-1)
+    w = src - a
+    y = x.copy()
+    y[i0:i1+1] = (1-w) * seg[a] + w * seg[b]
+    return y
+
+def metrics(y):
+    y = np.asarray(y, float)
+    d = doys(len(y))
+    wm = (d >= WARM_DOY[0]) & (d <= WARM_DOY[1])
+    yw = y[wm]
+    top_idx = np.argsort(y)[-3:]
+    return {
+        "warm_p95": float(np.nanpercentile(yw, 95)),
+        "heat_load": float(np.nansum(np.maximum(0, yw - np.nanmedian(yw))) * DT),
+        "peak_doy": float(np.mean(d[top_idx])),
+    }
+
+
+# ============================================================
+# 3. Load final NPZ and build NH Köppen labels
+# ============================================================
+
+npz = np.load(NPZ_PATH, allow_pickle=True)
+X_npz = npz["X"].astype(np.float32)
+channels_npz = npz["channels"].astype(object).tolist()
+city_npz = npz["sample_city_name"].astype(str)
+lat_npz = npz["sample_lat"].astype(float)
+month_npz = npz["sample_month"].astype(int)
+
+print("Loaded final NPZ:", X_npz.shape)
+print("Channels:", channels_npz)
+
+meta = pd.read_excel(CITY_INFO)
+city_col = find_best_city_col(meta, np.unique(city_npz))
+kop_col = find_best_koppen_col(meta)
+
+print("Selected city column:", city_col)
+print("Selected Köppen column:", kop_col)
+
+meta2 = meta[[city_col, kop_col]].copy()
+meta2.columns = ["city", "koppen_raw"]
+meta2["key"] = meta2["city"].apply(norm_city)
+meta2["koppen_code"] = meta2["koppen_raw"].apply(extract_koppen_code)
+meta2["clim_major"] = meta2["koppen_code"].astype(str).str[0].str.upper()
+meta2.loc[~meta2["clim_major"].isin(CLIM_ORDER), "clim_major"] = "UNK"
+
+city2clim = dict(zip(meta2["key"], meta2["clim_major"]))
+sample_key = np.array([norm_city(c) for c in city_npz], object)
+sample_clim = np.array([city2clim.get(k, "UNK") for k in sample_key], object)
+
+mask_nh = (lat_npz > 0) & np.isin(sample_clim, CLIM_ORDER)
+
+print("NH samples:", int(mask_nh.sum()), "/", len(mask_nh))
+print(pd.Series(sample_clim[mask_nh]).value_counts())
+
+if mask_nh.sum() == 0:
+    raise RuntimeError("No NH samples.")
+
+
+# ============================================================
+# 4. Build typical seasonal library for A/B/C/D
+# ============================================================
+
+lib = {}
+
+for clim in CLIM_ORDER:
+    mask_clim = mask_nh & (sample_clim == clim)
+    if mask_clim.sum() == 0:
+        continue
+
+    base = pd.DataFrame({
+        "city": city_npz[mask_clim],
+        "month": month_npz[mask_clim],
+    })
+
+    lib[clim] = {}
+
+    for ch, var in NPZ_VAR_MAP.items():
+        if ch not in channels_npz:
+            continue
+
+        vals = X_npz[mask_clim, channels_npz.index(ch)]
+
+        tmp = base.copy()
+        tmp["value"] = vals
+        tmp = tmp[np.isfinite(tmp["value"])]
+
+        cm = tmp.groupby(["city", "month"], as_index=False)["value"].mean()
+
+        city_curves = []
+        for _, g in cm.groupby("city"):
+            curve = interp_month_to_46(g["month"].values, g["value"].values)
+            if np.isfinite(curve).sum() > 0:
+                city_curves.append(curve)
+
+        if len(city_curves) == 0:
+            continue
+
+        arr = np.vstack(city_curves)
+
+        lib[clim][var] = {
+            "mean": np.nanmean(arr, axis=0),
+            "p10": np.nanpercentile(arr, 10, axis=0),
+            "p90": np.nanpercentile(arr, 90, axis=0),
+            "mean_s": smooth_curve(np.nanmean(arr, axis=0)),
+            "p10_s": smooth_curve(np.nanpercentile(arr, 10, axis=0)),
+            "p90_s": smooth_curve(np.nanpercentile(arr, 90, axis=0)),
+            "n_series": len(city_curves),
+        }
+
+print("Climate groups in lib:", sorted(lib.keys()))
+
+
+# ============================================================
+# 5. Load model
+# ============================================================
+
+model = CatBoostRegressor()
+model.load_model(MODEL_PATH)
+
+channels = np.load(CHANNELS_NPY, allow_pickle=True).tolist()
+feat2idx = {c: i for i, c in enumerate(channels)}
+
+print("Model channels:", channels)
+
+for clim in lib:
+    missing = []
+    for ch in channels:
+        var = None
+        for k, v in MODEL_VAR_MAP.items():
+            if v == ch:
+                var = k
+                break
+        if var not in lib[clim]:
+            missing.append(ch)
+    if missing:
+        raise RuntimeError(f"{clim} missing model predictors: {missing}")
+
+
+# ============================================================
+# 6. Monte Carlo simulation across A/B/C/D
+# ============================================================
+
+rng = np.random.default_rng(SEED)
+
+rows = []
+Y0_all = []
+Y10_all = []
+Y30_all = []
+CLIM_ALL = []
+
+X0_show = None
+scenarios_show = None
+
+for clim in sorted(lib.keys()):
+    print("MC clim:", clim)
+
+    for mc in range(N_MC_PER_CLIM):
+        X0 = np.zeros((T, len(channels)), np.float32)
+
+        for ch in channels:
+            var = None
+            for k, v in MODEL_VAR_MAP.items():
+                if v == ch:
+                    var = k
+                    break
+
+            obj = lib[clim][var]
+            mean = obj["mean"]
+            p10 = obj["p10"]
+            p90 = obj["p90"]
+
+            sig = (p90 - p10) / 2.563
+            sigma0 = np.nanmedian(sig) * NOISE_SCALE * NOISE_MULT.get(ch, 0.08)
+
+            x = mean + ar1_noise(T, sigma0, AR1_RHO, rng)
+            x = np.clip(x, p10, p90)
+
+            X0[:, feat2idx[ch]] = x.astype(np.float32)
+
+        y0 = model.predict(X0).astype(np.float32)
+        m0 = metrics(y0)
+
+        scen = {"Baseline": {"X": X0.copy(), "y": y0, "metrics": m0}}
+
+        for d in ADVANCE_LIST:
+            X1 = X0.copy()
+
+            for ch in VEG_CH:
+                j = feat2idx[ch]
+                X1[:, j] = shift_window_no_wrap(X1[:, j], d, GREENUP_DOY).astype(np.float32)
+
+            y1 = model.predict(X1).astype(np.float32)
+            m1 = metrics(y1)
+
+            scen[f"Advance {d} d"] = {
+                "X": X1,
+                "y": y1,
+                "metrics": m1,
+                "delta_p95": m1["warm_p95"] - m0["warm_p95"],
+                "delta_heat": m1["heat_load"] - m0["heat_load"],
+                "delta_peak": m1["peak_doy"] - m0["peak_doy"],
+            }
+
+            rows.append({
+                "clim": clim,
+                "mc": mc,
+                "delta_days": d,
+                "d_warm_p95": m1["warm_p95"] - m0["warm_p95"],
+                "d_heat_expo": m1["heat_load"] - m0["heat_load"],
+                "d_peak_time": m1["peak_doy"] - m0["peak_doy"],
+            })
+
+
+        Y0_all.append(y0)
+        Y10_all.append(scen["Advance 10 d"]["y"])
+        Y30_all.append(scen["Advance 30 d"]["y"])
+        CLIM_ALL.append(clim)
+        if X0_show is None:
+            X0_show = X0.copy()
+            scenarios_show = scen
+
+Y0_all = np.asarray(Y0_all)
+Y10_all = np.asarray(Y10_all)
+Y30_all = np.asarray(Y30_all)
+CLIM_ALL = np.asarray(CLIM_ALL)
+
+df_raw = pd.DataFrame(rows)
+df_raw.to_csv(OUT_RAW, index=False)
+
+summary_rows = []
+for d in ADVANCE_LIST:
+    sub = df_raw[df_raw["delta_days"] == d]
+    row = {"delta_days": d, "n": len(sub)}
+    for key in ["d_warm_p95", "d_heat_expo", "d_peak_time"]:
+        v = sub[key].values
+        row[key + "_mean"] = float(np.mean(v))
+        row[key + "_lo"] = float(np.mean(v) - 1.96 * np.std(v) / np.sqrt(len(v)))
+        row[key + "_hi"] = float(np.mean(v) + 1.96 * np.std(v) / np.sqrt(len(v)))
+    summary_rows.append(row)
+
+df_summary = pd.DataFrame(summary_rows)
+df_summary.to_csv(OUT_TABLE, index=False)
+
+print("\nMC summary:")
+print(df_summary.to_string(index=False))
+print("Saved:", OUT_RAW)
+print("Saved:", OUT_TABLE)
+
+
+# ============================================================
+# 7. Aggregated curves for plotting
+# ============================================================
+
+Y0_mean = np.nanmean(Y0_all, axis=0)
+Y10_mean = np.nanmean(Y10_all, axis=0)
+Y30_mean = np.nanmean(Y30_all, axis=0)
+
+# For panels a-c, use equal average across climate-group typical means
+curves_plot = {}
+
+for var in ["EVI", "LAI", "ERA5_VPD", "ERA5_SSRD", "ERA5_SWVL1"]:
+    arr_mean, arr_p10, arr_p90 = [], [], []
+    for clim in lib:
+        if var in lib[clim]:
+            arr_mean.append(lib[clim][var]["mean"])
+            arr_p10.append(lib[clim][var]["p10"])
+            arr_p90.append(lib[clim][var]["p90"])
+    if len(arr_mean) > 0:
+        curves_plot[var] = {
+            "mean_s": smooth_curve(np.nanmean(np.vstack(arr_mean), axis=0)),
+            "p10_s": smooth_curve(np.nanmean(np.vstack(arr_p10), axis=0)),
+            "p90_s": smooth_curve(np.nanmean(np.vstack(arr_p90), axis=0)),
+        }
+
+# Visual phenology operator based on mean X across first scenario is less meaningful;
+# use aggregated EVI/LAI curves from curves_plot for panel b.
+Xvis = np.zeros((T, len(channels)), np.float32)
+for var, model_ch in MODEL_VAR_MAP.items():
+    vals = []
+    for clim in lib:
+        if var in lib[clim]:
+            vals.append(lib[clim][var]["mean"])
+    if len(vals) and model_ch in feat2idx:
+        Xvis[:, feat2idx[model_ch]] = np.nanmean(np.vstack(vals), axis=0)
+
+
+scenarios_vis = {"Baseline": {"X": Xvis.copy()}}
+
+for d in ADVANCE_LIST:
+    X1 = Xvis.copy()
+    for ch in VEG_CH:
+        j = feat2idx[ch]
+        X1[:, j] = shift_window_no_wrap(X1[:, j], d, GREENUP_DOY).astype(np.float32)
+    scenarios_vis[f"Advance {d} d"] = {"X": X1}
+
+
+# ============================================================
+# 8. Plot
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 9.5,
+    "axes.labelsize": 9.5,
+    "axes.titlesize": 10.5,
+    "xtick.labelsize": 8.5,
+    "ytick.labelsize": 8.5,
+    "legend.fontsize": 8.3,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 150,
+    "savefig.dpi": 600,
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+})
+
+COL_EVI   = "#1b9e77"
+COL_LAI   = "#d95f02"
+COL_LST   = "#1f78b4"
+COL_ADV10 = "#66c2a5"
+COL_ADV30 = "#238b45"
+COL_SHADE = "#d9e8f5"
+COL_GRAY  = "#777777"
+COL_MC    = "#9CA3AF"
+
+D = doys(T)
+
+fig, axes = plt.subplots(
+    2, 2,
+    figsize=(14.8, 7.6),
+    gridspec_kw={"hspace": 0.42, "wspace": 0.58}
+)
+
+axes = axes.ravel()
+
+fig.subplots_adjust(
+    left=0.07,
+    right=0.78,
+    top=0.90,
+    bottom=0.10,
+    hspace=0.42,
+    wspace=0.58
+)
+
+
+# Panel a
+ax = axes[0]
+
+for var, color, label in [
+    ("EVI", COL_EVI, "EVI"),
+    ("LAI", COL_LAI, "LAI"),
+]:
+    if var not in curves_plot:
+        continue
+
+    y = normalize01(curves_plot[var]["mean_s"])
+    p10 = normalize01(curves_plot[var]["p10_s"])
+    p90 = normalize01(curves_plot[var]["p90_s"])
+
+    ax.fill_between(D, p10, p90, color=color, alpha=0.12, linewidth=0, label=f"{label} observed p10–p90")
+    ax.plot(D, y, color=color, linewidth=2.6, label=f"{label} observed mean")
+
+ax.axvspan(*GREENUP_DOY, color=COL_GRAY, alpha=0.10)
+ax.set_title("a  Observation-derived vegetation baselines", loc="left", fontweight="bold")
+ax.set_xlabel("Day of year")
+ax.set_ylabel("Normalized vegetation activity")
+ax.set_xlim(0, 365)
+ax.set_ylim(-0.05, 1.08)
+ax.set_xticks([0, 90, 180, 270, 360])
+ax.grid(True, linestyle=":", alpha=0.30)
+ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.00), borderaxespad=0)
+
+
+# Panel b
+ax = axes[1]
+
+evi_idx = feat2idx["EVI.EVI"]
+lai_idx = feat2idx["LAI.LAI"]
+
+ax.plot(D, normalize01(scenarios_vis["Baseline"]["X"][:, evi_idx]), color=COL_EVI, linewidth=2.6, label="EVI baseline")
+ax.plot(D, normalize01(scenarios_vis["Baseline"]["X"][:, lai_idx]), color=COL_LAI, linewidth=2.6, label="LAI baseline")
+
+for d, ls in zip(ADVANCE_LIST, ["--", "-."]):
+    name = f"Advance {d} d"
+    ax.plot(D, normalize01(scenarios_vis[name]["X"][:, evi_idx]), color=COL_EVI, linestyle=ls, linewidth=2.2, label=f"EVI advanced {d} d")
+    ax.plot(D, normalize01(scenarios_vis[name]["X"][:, lai_idx]), color=COL_LAI, linestyle=ls, linewidth=2.2, label=f"LAI advanced {d} d")
+
+ax.axvspan(*GREENUP_DOY, color=COL_GRAY, alpha=0.10)
+ax.set_title("b  Counterfactual phenology advancement", loc="left", fontweight="bold")
+ax.set_xlabel("Day of year")
+ax.set_ylabel("Normalized vegetation activity")
+ax.set_xlim(0, 365)
+ax.set_ylim(-0.05, 1.08)
+ax.set_xticks([0, 90, 180, 270, 360])
+ax.grid(True, linestyle=":", alpha=0.30)
+ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.00), borderaxespad=0)
+
+
+# Panel c
+ax = axes[2]
+
+for var, label, color in [
+    ("ERA5_VPD", "VPD", "#7570b3"),
+    ("ERA5_SSRD", "Solar radiation", "#e7298a"),
+    ("ERA5_SWVL1", "Soil moisture", "#66a61e"),
+]:
+    if var not in curves_plot:
+        continue
+
+    y = normalize01(curves_plot[var]["mean_s"])
+    p10 = normalize01(curves_plot[var]["p10_s"])
+    p90 = normalize01(curves_plot[var]["p90_s"])
+
+    ax.fill_between(D, p10, p90, color=color, alpha=0.08, linewidth=0, label=f"{label} p10–p90")
+    ax.plot(D, y, color=color, linewidth=2.2, label=f"{label} mean")
+
+ax.axvspan(*WARM_DOY, color=COL_SHADE, alpha=0.45)
+ax.set_title("c  Environmental context held fixed", loc="left", fontweight="bold")
+ax.set_xlabel("Day of year")
+ax.set_ylabel("Normalized environmental drivers")
+ax.set_xlim(0, 365)
+ax.set_ylim(-0.05, 1.08)
+ax.set_xticks([0, 90, 180, 270, 360])
+ax.grid(True, linestyle=":", alpha=0.30)
+ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.00), borderaxespad=0)
+
+
+# Panel d
+# Panel d
+ax = axes[3]
+
+# ============================================================
+# Aggregate Monte Carlo baseline samples into mean ± interval
+# ============================================================
+
+Y0_s = np.vstack([smooth_curve(y, window=7) for y in Y0_all])
+Y10_s = np.vstack([smooth_curve(y, window=7) for y in Y10_all])
+Y30_s = np.vstack([smooth_curve(y, window=7) for y in Y30_all])
+
+Y0_mean = np.nanmean(Y0_s, axis=0)
+Y0_lo = np.nanpercentile(Y0_s, 10, axis=0)
+Y0_hi = np.nanpercentile(Y0_s, 90, axis=0)
+
+Y10_mean = np.nanmean(Y10_s, axis=0)
+Y30_mean = np.nanmean(Y30_s, axis=0)
+
+# Monte Carlo baseline summarized as band, not individual lines
+ax.fill_between(
+    D,
+    Y0_lo,
+    Y0_hi,
+    color=COL_MC,
+    alpha=0.18,
+    linewidth=0,
+    label="Monte Carlo baseline p10–p90"
+)
+
+ax.plot(
+    D,
+    Y0_mean,
+    color=COL_LST,
+    linewidth=2.4,
+    label="Mean LST baseline",
+    zorder=5
+)
+
+ax.plot(
+    D,
+    Y10_mean,
+    color=COL_ADV10,
+    linestyle="--",
+    linewidth=2.2,
+    label="Mean LST, vegetation advanced 10 d",
+    zorder=6
+)
+
+ax.plot(
+    D,
+    Y30_mean,
+    color=COL_ADV30,
+    linestyle="-.",
+    linewidth=2.2,
+    label="Mean LST, vegetation advanced 30 d",
+    zorder=6
+)
+
+# Use green-up window here, because this panel explains the perturbation workflow
+ax.axvspan(
+    GREENUP_DOY[0],
+    GREENUP_DOY[1],
+    color=COL_GRAY,
+    alpha=0.10,
+    zorder=0
+)
+
+ax.set_title("d  Predicted LST response", loc="left", fontweight="bold")
+ax.set_xlabel("Day of year")
+ax.set_ylabel("Predicted LST (°C)")
+ax.set_xlim(0, 365)
+ax.set_xticks([0, 90, 180, 270, 360])
+ax.grid(True, linestyle=":", alpha=0.30)
+
+ax.legend(
+    frameon=False,
+    loc="upper left",
+    bbox_to_anchor=(1.02, 1.00),
+    borderaxespad=0
+)
