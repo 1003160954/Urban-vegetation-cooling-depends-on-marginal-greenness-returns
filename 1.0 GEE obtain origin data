@@ -1,0 +1,1114 @@
+/**** City | Annual Land Cover stack (2013–2025) | MODIS MCD12Q1 v061 (IGBP)
+      Output: ONE multi-band GeoTIFF (bands: LC_2013 … LC_2025)
+      Grid aligned to EPSG:4326 @ 0.005°, region=roiRect, dimensions fixed ****/
+
+/* ===== 0) Parameters ===== */
+var CITY_NAME       = 'MexicoCityLaLaguna';
+var CITY_LON        = -99.1061;
+var CITY_LAT        = 19.46855;
+var CITY_BUFFER_KM  = 80;          // display buffer
+
+var START_YEAR = 2013;
+var END_YEAR   = 2025;             // falls back to latest available for missing years
+
+var EXPORT_CRS     = 'EPSG:4326';
+var DEG_PER_PIXEL  = 0.005;        // ~500m near equator
+var DO_EXPORT      = true;
+
+var EXPORT_FOLDER  = 'MODIS_LC_STACK_CITY_' + CITY_NAME;
+
+/* ===== 1) ROI (match your LST export setup) ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);  // for map preview
+var roiRect    = cityBuffer.bounds();                       // export region
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiRect, {color:'red'}, CITY_NAME + ' ROI (export region)', false);
+
+// Fixed pixel matrix at 0.005°
+var rect = ee.List(roiRect.coordinates().get(0));
+var xs = rect.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = rect.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+print('Export dims @ 0.005°:', EXPORT_DIMS);
+
+/* ===== 2) MODIS MCD12Q1 (IGBP classes 0–16) ===== */
+var LC = ee.ImageCollection('MODIS/061/MCD12Q1').select('LC_Type1');
+
+// Latest available LC year (e.g., 2024 as of now)
+var latestImg   = LC.sort('system:time_start', false).first();
+var latestYear  = ee.Date(latestImg.get('system:time_start')).get('year');
+print('Latest available LC year =', latestYear);
+
+/* ===== 3) Build a single-band image for a given year (fallback to latest if missing)
+         NOTE: we keep the original band name 'LC_Type1' — no server-side renaming here. */
+function lcBandForYear(y){
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = ee.Date.fromYMD(y.add(1), 1, 1);
+
+  var subset = LC.filterDate(start, end);
+  var has    = subset.size().gt(0);
+
+  var img = ee.Image(ee.Algorithms.If(
+    has,
+    subset.first(),
+    LC.filterDate(ee.Date.fromYMD(latestYear,1,1), ee.Date.fromYMD(latestYear.add(1),1,1)).first()
+  ));
+
+  return ee.Image(img).clip(roiRect).toInt8();  // band name stays 'LC_Type1'
+}
+
+/* ===== 4) Build the annual stack (2013–2025) as a single multi-band image ===== */
+var yearsEE = ee.List.sequence(START_YEAR, END_YEAR);
+var imgList = yearsEE.map(lcBandForYear);                   // list of single-band images
+var stack   = ee.ImageCollection.fromImages(imgList).toBands(); // bands: 0_LC_Type1, 1_LC_Type1, ...
+
+// ---- Rename bands using a client-side list of names (pure JS strings) ----
+var yearsJS = yearsEE.getInfo();                             // [2013, 2014, ..., 2025]
+var desiredNames = yearsJS.map(function(y){ return 'LC_' + y; });
+
+print('Desired band names:', desiredNames);
+stack = stack.rename(desiredNames).clip(roiRect);
+
+// Quick preview: show one band (e.g., LC_2013)
+Map.addLayer(stack.select(['LC_2013']), {min:0, max:16},
+             CITY_NAME + ' | LC_2013', false);
+
+print('Final stack bands:', stack.bandNames());
+
+/* ===== 5) Export: ONE multi-band GeoTIFF (bands = LC_2013 … LC_2025) ===== */
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack,             // multi-band image
+    description   : CITY_NAME + '_MODIS_LC_STACK_2013_2025_0p005deg',
+    folder        : EXPORT_FOLDER,
+    fileNamePrefix: CITY_NAME + '_MODIS_LC_STACK_2013_2025_0p005deg',
+    region        : roiRect,
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),  // exact grid alignment
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ Created ONE export task: annual LC stack (2013–2025). Go to Tasks to run.');
+
+
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;  
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;   
+
+var START_YEAR      = 2013;
+var END_YEAR        = ee.Date(Date.now()).get('year').getInfo(); 
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;       // 0.1°
+var RR_MAXPIX       = 65535;   
+var USE_MEDIAN_AGG  = true;     
+var DO_EXPORT       = true;
+
+
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_DEM = 'DEM_8day_0p1deg_CITY_' + CITY_NAME;
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 2) （DEM） =====*/
+
+
+DEM_IMG = DEM_IMG.rename('elevation');
+
+
+function dateTagFromMillis(ms){
+  return ee.Date(ms).format('YYYYMMdd');
+}
+
+
+function eightDayStartsOfYear(year){
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year + 1, 1, 1);
+  var step  = 8; // 天
+  var list  = ee.List.sequence(0, end.difference(start, 'day').subtract(1), step);
+  return list.map(function(d){ return start.advance(ee.Number(d), 'day').millis(); });
+}
+
+
+function buildYearDEM_city(year){
+
+  var starts = eightDayStartsOfYear(year);  // list of millis
+  var bandImgs = ee.ImageCollection(starts.map(function(ms){
+    var tag = dateTagFromMillis(ms);
+
+    return DEM_IMG.rename(ee.String('DEM_').cat(tag));
+  })).toBands();
+
+
+  var oldNames = bandImgs.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bandImgs = bandImgs.rename(newNames);
+
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bandImgs.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01.set('year', year);
+}
+
+function exportYearDEM(year){
+  var img = buildYearDEM_city(year);
+
+  print('DEM Year', year, 'band count =', img.bandNames().size());
+  print('DEM first 8 bands:', img.bandNames().slice(0, 8));
+
+  var firstName = ee.String( ee.List(img.bandNames().sort()).get(0) );
+  Map.addLayer(img.select(ee.List([firstName])),
+               {min: -50, max: 2000, palette: ['#e0f3f8','#abd9e9','#74add1','#4575b4','#313695']},
+               CITY_NAME + ' DEM sample ' + year + ' (0.1°)', false);
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description   : CITY_NAME + '_DEM_8day_0p1deg_' + year,
+      folder        : EXPORT_FOLDER_DEM,
+      fileNamePrefix: CITY_NAME + '_DEM_8day_0p1deg_' + year,
+      region        : roiSafe,               
+      crs           : EXPORT_CRS,            
+      dimensions    : EXPORT_DIMS.getInfo(), 
+      maxPixels     : 1e13
+    });
+  }
+}
+
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+print('Years to export (DEM):', years, '| City:', CITY_NAME, '| dims:', EXPORT_DIMS);
+years.forEach(function(y){ exportYearDEM(y); });
+
+print('An annual DEM export task has been created: 0.1° alignment, Guangzhou 80km, 8-day bands (static DEM copied to each period). Launch the export from the Tasks panel.');
+
+/**** CITY | LST (Terra baseline + Aqua offset-constrained merge) | 8-day | 0.1° ****/
+
+/* ===== 0) 参数 ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2013;
+var END_YEAR        = 2023;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;   // 0.1°
+var RR_MAXPIX       = 65535;
+var USE_MEDIAN_AGG  = true;
+var DO_EXPORT       = true;
+
+/* ===== 1) ROI ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+var roiRect    = cityBuffer.bounds();
+
+/* ===== 2) 数据源 ===== */
+var TERRA = ee.ImageCollection('MODIS/061/MOD11A2')
+  .select(['LST_Day_1km', 'QC_Day']);
+
+var AQUA = ee.ImageCollection('MODIS/061/MYD11A2')
+  .select(['LST_Day_1km', 'QC_Day']);
+
+/* ===== 3) LST 预处理（QC + °C） ===== */
+function prepLST(img, name) {
+  var ok = img.select('QC_Day').bitwiseAnd(3).lte(1);
+  return img.select('LST_Day_1km')
+    .updateMask(ok)
+    .multiply(0.02).subtract(273.15)
+    .rename(name)
+    .copyProperties(img, img.propertyNames());
+}
+
+/* ===== 4) Aqua 匹配 Terra（±1 天） ===== */
+function matchAqua(terraImg) {
+  var t = ee.Date(terraImg.get('system:time_start'));
+  var aqua = AQUA
+    .filterDate(t.advance(-1, 'day'), t.advance(1, 'day'))
+    .map(function(im){ return prepLST(im, 'AQUA'); })
+    .median();
+  return terraImg.addBands(aqua);
+}
+
+/* ===== 5) 计算 Aqua–Terra offset（仅 Terra 有效处） ===== */
+function computeOffset(img) {
+  var terra  = img.select('TERRA');
+  var aqua   = img.select('AQUA');
+
+  var offset = aqua.subtract(terra)
+    .updateMask(terra.mask())
+    .rename('OFFSET');
+
+  // 物理约束：白天 Terra–Aqua 偏移一般 < 6°C
+  offset = offset.updateMask(offset.abs().lte(6));
+
+  return img.addBands(offset);
+}
+
+/* ===== 6) offset 校正 Aqua → 填补 Terra 缺测 ===== */
+function fillTerra(img) {
+  var terra  = img.select('TERRA');
+  var aqua   = img.select('AQUA');
+  var offset = img.select('OFFSET');
+
+  // Aqua 转换为“Terra 等效温度”
+  var aqua_as_terra = aqua.subtract(offset);
+
+  // 仅填补 Terra 缺测
+  var merged = terra.unmask(aqua_as_terra);
+
+  // 防止尖峰：限制与局地中值差异
+  var ref  = terra.focal_median(1, 'square', 'pixels');
+  var safe = merged.subtract(ref).abs().lte(5);
+
+  return merged.updateMask(safe)
+               .rename('LSTD')
+               .copyProperties(img, img.propertyNames());
+}
+
+/* ===== 7) 构建某一年 LST 多波段 ===== */
+function buildYearLST(year){
+  var start = ee.Date.fromYMD(year,1,1);
+  var end   = ee.Date.fromYMD(year+1,1,1);
+
+  var terraCol = TERRA
+    .filterDate(start, end)
+    .filterBounds(roiRect)
+    .map(function(im){ return prepLST(im, 'TERRA'); })
+    .sort('system:time_start');
+
+  var merged = terraCol
+    .map(matchAqua)
+    .map(computeOffset)
+    .map(fillTerra);
+
+  var bands = ee.ImageCollection(
+    merged.map(function(im){
+      var tag = ee.Date(im.get('system:time_start')).format('YYYYMMdd');
+      return im.rename(ee.String('LSTD_').cat(tag));
+    })
+  ).toBands();
+
+  // 清理 band 名
+  var cleanNames = bands.bandNames().map(function(n){
+    return ee.String(n).replace('^(\\d+_)+', '');
+  });
+  bands = bands.rename(cleanNames);
+
+  // 0.1° 聚合
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  return bands.reduceResolution({
+      reducer: reducer,
+      bestEffort: true,
+      maxPixels: RR_MAXPIX
+    })
+    .clip(roiRect)
+    .set('year', year);
+}
+
+/* ===== 8) 导出 ===== */
+function exportYear(year){
+  var img = buildYearLST(year);
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description: CITY_NAME + '_LST_8day_0p1deg_' + year,
+      folder: 'LST_8day_0p1deg_CITY_' + CITY_NAME,
+      fileNamePrefix: CITY_NAME + '_LST_8day_0p1deg_' + year,
+      region: roiRect,
+      crs: EXPORT_CRS,
+      maxPixels: 1e13
+    });
+  }
+}
+
+/* ===== 9) 批量运行 ===== */
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+years.forEach(exportYear);
+
+print('✅ Terra baseline + Aqua offset-constrained LST export tasks created.');
+
+
+/**** Guangzhou | No night-light mask | 8-day EVI | 0.1° alignment | Annual export (city-level 80km) ****/
+
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;    
+var CITY_LAT        = 23.1291;    
+var CITY_BUFFER_KM  = 80;         
+
+var START_YEAR      = 2013;
+var END_YEAR        = ee.Date(Date.now()).get('year').getInfo();
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;          // 0.1°
+var RR_MAXPIX       = 65535;      
+var USE_MEDIAN_AGG  = true;       
+var DO_EXPORT       = true;
+
+
+var cityPoint   = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer  = cityPoint.buffer(CITY_BUFFER_KM * 1000); // m
+var roiRect     = cityBuffer.bounds();                  
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(cityBuffer, {color: 'cyan'}, CITY_NAME + ' buffer (~' + CITY_BUFFER_KM + ' km)', false);
+Map.addLayer(roiRect, {color: 'red'}, CITY_NAME + ' ROI rect', true);
+
+var rectBounds  = roiRect.bounds().coordinates().get(0);
+rectBounds      = ee.List(rectBounds);
+var xs = rectBounds.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = rectBounds.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER = 'EVI_8day_0p1deg_CITY_' + CITY_NAME;
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+var SR = ee.ImageCollection('MODIS/061/MOD09A1')
+  .select(['sur_refl_b01','sur_refl_b02','sur_refl_b03','StateQA'],
+          ['red','nir','blue','StateQA']);
+
+function maskStateQA(img){
+  var qa = img.select('StateQA');
+  var modland_best = qa.bitwiseAnd(3).eq(0);  // MODLAND QA bits 0–1 == 0
+  return img.updateMask(modland_best);
+}
+
+function toEVI_robust(img){
+  img = maskStateQA(img);
+  var s = img.select(['red','nir','blue']).multiply(0.0001);
+  var evi = s.expression('2.5*(nir - red) / (nir + 6*red - 7.5*blue + 1)', {
+    nir: s.select('nir'), red: s.select('red'), blue: s.select('blue')
+  }).rename('EVI');
+
+  var eviClamped = evi.clamp(-0.1, 1);
+  var ok = evi.gte(-0.2).and(evi.lte(1.2));
+  eviClamped = eviClamped.updateMask(ok);
+
+  return eviClamped.copyProperties(img, img.propertyNames());
+}
+
+function fmtTag(img){
+  return ee.Date(img.get('system:time_start')).format('YYYYMMdd');
+}
+
+function buildYearEVI_city(year){
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = ee.Date.fromYMD(year + 1, 1, 1);
+
+  var col = SR.filterDate(start, end).filterBounds(roiRect)
+              .map(toEVI_robust)
+              .sort('system:time_start');
+
+  var count = col.size();
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('EVI_empty').clip(roiRect);
+
+  var eviBands = ee.Image(ee.Algorithms.If(count.gt(0),
+    ee.ImageCollection(col.map(function(im){
+      var tag = fmtTag(im);
+      return im.rename(ee.String('EVI_').cat(tag));
+    })).toBands(),
+    empty
+  ));
+
+  var oldNames = eviBands.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', ''); 
+  });
+  eviBands = eviBands.rename(newNames).clip(roiRect);
+
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var eviReduced_01deg = eviBands.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+
+  var namesAfterRR = eviReduced_01deg.bandNames();
+  var cleanedNames = namesAfterRR.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  eviReduced_01deg = eviReduced_01deg.rename(cleanedNames);
+
+  return eviReduced_01deg.clip(roiRect).set('year', year);
+}
+
+function exportYear(year){
+  var img = buildYearEVI_city(year);
+
+  print('Year', year, 'band count =', img.bandNames().size());
+  print('First 10 bands:', img.bandNames().slice(0, 10));
+
+  var firstName = ee.String( ee.List(img.bandNames().sort()).get(0) );
+  Map.addLayer(
+    img.select(ee.List([firstName])),
+    {min:0, max:0.8, palette:['440154','3b528b','21918c','5ec962','fde725']},
+    CITY_NAME + ' EVI sample ' + year + ' (0.1°)',
+    false
+  );
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description   : CITY_NAME + '_EVI_8day_0p1deg_' + year,
+      folder        : EXPORT_FOLDER,
+      fileNamePrefix: CITY_NAME + '_EVI_8day_0p1deg_' + year,
+      region        : roiRect,             
+      crs           : EXPORT_CRS,         
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+print('Years to export:', years, '| City:', CITY_NAME,
+      '| dims:', EXPORT_DIMS, '| no NL mask.');
+
+years.forEach(function(y){ exportYear(y); });
+
+print('An annual export task has been created (city-level 0.1°, 80km bounding box, no night light mask). Launch the export from the Tasks panel.');
+
+/**** Guangzhou |LAI (MOD15A2H v061) | 8-day | 0.1° alignment | Annual export (city-level 80km) ****/
+
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;  
+var CITY_LAT        = 23.1291;   
+var CITY_BUFFER_KM  = 80;      
+
+var START_YEAR      = 2013;
+var END_YEAR        = ee.Date(Date.now()).get('year').getInfo();  
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;   
+var RR_MAXPIX       = 65535;   
+var USE_MEDIAN_AGG  = true;     
+var DO_EXPORT       = true;
+
+
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_LAI = 'LAI_8day_0p1deg_CITY_' + CITY_NAME;
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+var LAI_IC = ee.ImageCollection('MODIS/061/MOD15A2H')
+  .select(['Lai_500m','FparLai_QC']);
+
+function laiWithQA(img){
+  var ok = img.select('FparLai_QC').bitwiseAnd(3).lte(1);
+  var lai = img.select('Lai_500m')
+    .updateMask(ok)
+    .multiply(0.1)  
+    .clamp(0, 7)      
+    .rename('LAI');
+  return lai.copyProperties(img, img.propertyNames());
+}
+
+function dateTag(im){
+  return ee.Date(im.get('system:time_start')).format('YYYYMMdd');
+}
+
+function buildYearLAI_city(year){
+  var start = ee.Date.fromYMD(year,1,1);
+  var end   = ee.Date.fromYMD(year+1,1,1);
+
+  var col = LAI_IC.filterDate(start, end).filterBounds(roiSafe)
+                  .map(laiWithQA)
+                  .sort('system:time_start');
+
+  var count = col.size();
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('LAI_empty');
+
+  var bands = ee.Image(ee.Algorithms.If(count.gt(0),
+    ee.ImageCollection(col.map(function(im){
+      var tag = dateTag(im);
+      return im.rename(ee.String('LAI_').cat(tag));
+    })).toBands(),
+    empty
+  ));
+
+  var oldNames = bands.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bands = bands.rename(newNames);
+
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bands.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01.set('year', year);
+}
+
+function exportYearLAI(year){
+  var img = buildYearLAI_city(year);
+
+  print('LAI Year', year, 'band count =', img.bandNames().size());
+  print('LAI first 8 bands:', img.bandNames().slice(0, 8));
+
+  var firstName = ee.String( ee.List(img.bandNames().sort()).get(0) );
+  Map.addLayer(img.select(ee.List([firstName])),
+               {min:0, max:6, palette:['f7fcf5','c7e9c0','74c476','238b45','00441b']},
+               CITY_NAME + ' LAI sample ' + year + ' (0.1°)', false);
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description   : CITY_NAME + '_LAI_8day_0p1deg_' + year,
+      folder        : EXPORT_FOLDER_LAI,
+      fileNamePrefix: CITY_NAME + '_LAI_8day_0p1deg_' + year,
+      region        : roiSafe,              
+      crs           : EXPORT_CRS,            
+      dimensions    : EXPORT_DIMS.getInfo(), 
+      maxPixels     : 1e13
+    });
+  }
+}
+
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+print('Years to export (LAI):', years, '| City:', CITY_NAME, '| dims:', EXPORT_DIMS);
+years.forEach(function(y){ exportYearLAI(y); });
+
+print('An LAI annual export task has been created: 0.1° alignment, Guangzhou 80km, 8-day. Proceed to the Tasks panel to initiate the export.');
+
+/**** Guangzhou | LST (MOD11A2 v061) | 8-day | 0.1° alignment | Annual export (city-level 80km) ****/
+
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;  
+var CITY_LAT        = 23.1291;   
+var CITY_BUFFER_KM  = 80;        
+
+var START_YEAR      = 2013;
+var END_YEAR        = ee.Date(Date.now()).get('year').getInfo(); 
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;     
+var RR_MAXPIX       = 65535;   
+var USE_MEDIAN_AGG  = true;    
+var DO_EXPORT       = true;
+
+var cityPoint   = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer  = cityPoint.buffer(CITY_BUFFER_KM * 1000); // m
+var roiRect     = cityBuffer.bounds();
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiRect, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+
+var rectBounds  = ee.List(roiRect.bounds().coordinates().get(0));
+var xs = rectBounds.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = rectBounds.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round(); 
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round(); 
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_LST = 'LST_8day_0p1deg_CITY_' + CITY_NAME;
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+
+var LST_IC = ee.ImageCollection('MODIS/061/MOD11A2')
+  .select(['LST_Day_1km','LST_Night_1km','QC_Day','QC_Night']);
+
+function lstDayNightC(img) {
+  var okDay   = img.select('QC_Day').bitwiseAnd(3).lte(1);
+  var okNight = img.select('QC_Night').bitwiseAnd(3).lte(1);
+
+  var dayC = img.select('LST_Day_1km')
+    .updateMask(okDay)
+    .multiply(0.02).subtract(273.15)
+    .rename('LSTD');
+
+  var nightC = img.select('LST_Night_1km')
+    .updateMask(okNight)
+    .multiply(0.02).subtract(273.15)
+    .rename('LSTN');
+
+  return dayC.addBands(nightC).copyProperties(img, img.propertyNames());
+}
+
+function dateTag(im){
+  return ee.Date(im.get('system:time_start')).format('YYYYMMdd');
+}
+
+function buildYearLST_city(year){
+  var start = ee.Date.fromYMD(year,1,1);
+  var end   = ee.Date.fromYMD(year+1,1,1);
+
+  var col = LST_IC.filterDate(start, end).filterBounds(roiRect)
+                  .map(lstDayNightC)
+                  .sort('system:time_start');
+
+  var count = col.size();
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('LST_empty').clip(roiRect);
+
+  var bands = ee.Image(ee.Algorithms.If(count.gt(0),
+    ee.ImageCollection(col.map(function(im){
+      var tag = dateTag(im);
+      var d = im.select('LSTD').rename(ee.String('LSTD_').cat(tag));
+      var n = im.select('LSTN').rename(ee.String('LSTN_').cat(tag));
+      return d.addBands(n);
+    })).toBands(),
+    empty
+  ));
+
+  var oldNames = bands.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bands = bands.rename(newNames).clip(roiRect);
+
+
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bands.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  return bands01.clip(roiRect).set('year', year);
+}
+
+function exportYearLST(year){
+  var img = buildYearLST_city(year);
+
+  print('LST Year', year, 'band count =', img.bandNames().size());
+  print('LST first 8 bands:', img.bandNames().slice(0, 8));
+
+  var firstName = ee.String( ee.List(img.bandNames().sort()).get(0) );
+  Map.addLayer(img.select(ee.List([firstName])),
+               {min:-5, max:45}, CITY_NAME + ' LST sample ' + year + ' (0.1°)', false);
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description   : CITY_NAME + '_LST_8day_0p1deg_' + year,
+      folder        : EXPORT_FOLDER_LST,
+      fileNamePrefix: CITY_NAME + '_LST_8day_0p1deg_' + year,
+      region        : roiRect,
+      crs           : EXPORT_CRS,
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+print('Years to export (LST):', years, '| City:', CITY_NAME, '| dims:', EXPORT_DIMS);
+years.forEach(function(y){ exportYearLST(y); });
+
+print('LST annual export task created: 0.1° alignment, Guangzhou 80km, 8-day. Proceed to the Tasks panel to initiate export.');
+
+/**** Guangzhou |Nighttime Light (VIIRS VCMCFG Monthly) | 0.1° Alignment | Annual Export ****/
+
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2013;
+var END_YEAR        = ee.Date(Date.now()).get('year').getInfo();
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;
+var RR_MAXPIX       = 65535;
+var USE_MEDIAN_AGG  = true;
+var DO_EXPORT       = true;
+
+/* ===== ROI ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_NTL = 'NTL_monthly_0p1deg_CITY_' + CITY_NAME;
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color:'blue'}, CITY_NAME + ' ROI rect', false);
+
+var NTL_IC = ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG")
+  .select(['avg_rad']);
+
+function dateTag(im){
+  return ee.Date(im.get('system:time_start')).format('YYYYMM');
+}
+
+function buildYearNTL_city(year){
+  var start = ee.Date.fromYMD(year,1,1);
+  var end   = ee.Date.fromYMD(year+1,1,1);
+
+  var col = NTL_IC.filterDate(start, end).filterBounds(roiSafe)
+                  .map(function(im){
+                    var tag = dateTag(im);
+                    return im.rename(ee.String('NTL_').cat(tag));
+                  })
+                  .sort('system:time_start');
+
+  var count = col.size();
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('NTL_empty');
+
+  var bands = ee.Image(ee.Algorithms.If(count.gt(0),
+    col.toBands(),
+    empty
+  ));
+
+  var oldNames = bands.bandNames();
+  var newNames = oldNames.map(function(n){
+    return ee.String(n).replace('^(\\d+_)+', '');
+  });
+  bands = bands.rename(newNames);
+
+
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bands.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    return ee.String(n).replace('_median$', '').replace('_mean$', '');
+  });
+  bands01 = bands01.rename(cleaned);
+
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01.set('year', year);
+}
+
+function exportYearNTL(year){
+  var img = buildYearNTL_city(year);
+
+  print('NTL Year', year, 'band count =', img.bandNames().size());
+
+  var firstName = ee.String(ee.List(img.bandNames().sort()).get(0));
+  Map.addLayer(img.select([firstName]),
+               {min:0, max:50, palette:['black','orange','red']},
+               CITY_NAME + ' NTL sample ' + year, false);
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description   : CITY_NAME + '_NTL_monthly_0p1deg_' + year,
+      folder        : EXPORT_FOLDER_NTL,
+      fileNamePrefix: CITY_NAME + '_NTL_monthly_0p1deg_' + year,
+      region        : roiSafe,
+      crs           : EXPORT_CRS,
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+years.forEach(function(y){ exportYearNTL(y); });
+
+print('NTL annual export task created: 0.1° alignment, Guangzhou 80km, monthly bands. Launch export via the Tasks panel.');
+
+/**** Guangzhou | ERA5-Land Daily Aggregates → 8-day | 0.1° Alignment | Annual Merge Export (Fixed Naming & Robust Gap Handling) ****/
+
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2013;
+var END_YEAR        = ee.Date(Date.now()).get('year').getInfo();
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;    
+var DO_EXPORT       = true;
+
+var EXPORT_FOLDER_ERA = 'ERA5L_8day_0p1deg_CITY_' + CITY_NAME;
+
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'orange'}, CITY_NAME + ' ROI rect', false);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+var ERA = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .select([
+    'temperature_2m',
+    'dewpoint_temperature_2m',
+    'u_component_of_wind_10m',
+    'v_component_of_wind_10m',
+    'surface_solar_radiation_downwards_sum',
+    'total_precipitation_sum',
+    'volumetric_soil_water_layer_1',
+    'soil_temperature_level_1'
+  ]);
+
+function list8dayDates(year){
+  var y = ee.Number(year);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = ee.Date.fromYMD(y.add(1), 1, 1);
+  var nDays = end.difference(start, 'day');
+  var steps = ee.List.sequence(0, nDays.subtract(1), 8);
+  return steps.map(function(d){ return start.advance(ee.Number(d), 'day'); });
+}
+function tagYYYYMMDD(date){ return ee.Date(date).format('YYYYMMdd'); }
+
+function vpdFromT_Td_C(tC, tdC){
+  return tC.expression(
+    '0.6108*exp(17.27*T/(T+237.3)) - 0.6108*exp(17.27*Td/(Td+237.3))',
+    {T: tC, Td: tdC}
+  ).rename('VPD_kPa');
+}
+
+function emptyBandsForTag(tag){  // tag: ee.String
+  var e = ee.Image(0).updateMask(ee.Image(0)); 
+  return e.rename(ee.String('T2M_C_').cat(tag))
+    .addBands(e.rename(ee.String('TD_C_').cat(tag)))
+    .addBands(e.rename(ee.String('VPD_kPa_').cat(tag)))
+    .addBands(e.rename(ee.String('WIND10M_MS_').cat(tag)))
+    .addBands(e.rename(ee.String('SSRD_MJm2_').cat(tag)))
+    .addBands(e.rename(ee.String('TP_mm_').cat(tag)))
+    .addBands(e.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+    .addBands(e.rename(ee.String('STL1_C_').cat(tag)));
+}
+
+function aggregate8dayWindow(dStart){
+  dStart = ee.Date(dStart);
+  var dEnd = dStart.advance(8, 'day');
+  var tag  = tagYYYYMMDD(dStart);            
+
+  var daily = ERA.filterDate(dStart, dEnd).filterBounds(roiSafe);
+  var hasData = daily.size().gt(0);
+
+  var out = ee.Image(ee.Algorithms.If(hasData, (function(){
+
+    var T2M_C = daily.select('temperature_2m').mean().subtract(273.15).rename('T2M_C');
+    var TD_C  = daily.select('dewpoint_temperature_2m').mean().subtract(273.15).rename('TD_C');
+
+
+    var U = daily.select('u_component_of_wind_10m').mean();
+    var V = daily.select('v_component_of_wind_10m').mean();
+    var WIND = U.hypot(V).rename('WIND10M_MS');
+
+
+    var SSRD_MJ = daily.select('surface_solar_radiation_downwards_sum').sum().divide(1e6).rename('SSRD_MJm2');
+    var TP_mm   = daily.select('total_precipitation_sum').sum().multiply(1000).rename('TP_mm');
+
+
+    var SWVL1 = daily.select('volumetric_soil_water_layer_1').mean().rename('SWVL1_m3m3');
+    var STL1C = daily.select('soil_temperature_level_1').mean().subtract(273.15).rename('STL1_C');
+
+    var VPD = vpdFromT_Td_C(T2M_C, TD_C);
+
+
+    return T2M_C.rename(ee.String('T2M_C_').cat(tag))
+      .addBands(TD_C.rename(ee.String('TD_C_').cat(tag)))
+      .addBands(VPD.rename(ee.String('VPD_kPa_').cat(tag)))
+      .addBands(WIND.rename(ee.String('WIND10M_MS_').cat(tag)))
+      .addBands(SSRD_MJ.rename(ee.String('SSRD_MJm2_').cat(tag)))
+      .addBands(TP_mm.rename(ee.String('TP_mm_').cat(tag)))
+      .addBands(SWVL1.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+      .addBands(STL1C.rename(ee.String('STL1_C_').cat(tag)));
+  })(), emptyBandsForTag(tag)));
+
+  return out;
+}
+
+
+function buildYearERA8day(year){
+  year = ee.Number(year);
+  var dates8 = ee.List(list8dayDates(year));
+
+  var img = ee.ImageCollection.fromImages(dates8.map(aggregate8dayWindow)).toBands();
+
+
+  var old = img.bandNames();
+  var neu = old.map(function(n){ return ee.String(n).replace('^(\\d+_)+',''); });
+  img = img.rename(neu);
+
+
+  img = img.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  img = img.clip(roiSafe);
+
+  return img.set('year', year);
+}
+
+
+function exportYearERA(y){
+  var img = buildYearERA8day(y);
+
+  print('ERA5-Land (8-day) Year', y, 'band count =', img.bandNames().size());
+  print('First 12 bands:', img.bandNames().slice(0, 12));
+
+  var t2mBands = img.bandNames().filter(ee.Filter.stringContains('item', 'T2M_C_'));
+  var firstName = ee.String(t2mBands.sort().get(0));
+  Map.addLayer(
+    img.select(ee.List([firstName])),
+    {min:-5, max:35},
+    CITY_NAME + ' ERA sample ' + y + ' (0.1°)',
+    false
+  );
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image: img.toFloat(),
+      description   : CITY_NAME + '_ERA5Lmain_8day_0p1deg_' + y,
+      folder        : EXPORT_FOLDER_ERA,
+      fileNamePrefix: CITY_NAME + '_ERA5Lmain_8day_0p1deg_' + y,
+      region        : roiSafe,
+      crs           : EXPORT_CRS,
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+
+var years = ee.List.sequence(START_YEAR, END_YEAR).getInfo();
+print('Years to export (ERA5-Land main, 8-day, robust):', years, '| City:', CITY_NAME, '| dims:', EXPORT_DIMS);
+years.forEach(function(y){ exportYearERA(y); });
+
+print('An ERA5-Land climate main ensemble annual export task has been created (8-day step, full mask for gaps, placeholder values not filled).');
