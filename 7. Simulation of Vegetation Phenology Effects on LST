@@ -9,11 +9,7 @@ import pandas as pd
 # 0. Paths
 # ============================================================
 
-# 建议用你补齐 WIND10M / SWVL1 / STL1 后的 NPZ
 NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
-
-# 如果补齐版还没生成，可以先用原始 metadata NPZ，但会缺 WIND10M / SWVL1 / STL1
-# NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST.npz"
 
 CITY_INFO = "/content/drive/MyDrive/anature_revised/selected_cities_fullinfo_with_koppen.xlsx"
 
