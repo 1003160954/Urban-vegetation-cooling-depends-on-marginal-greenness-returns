@@ -1,0 +1,123 @@
+!pip install catboost shap -q
+import os, json, numpy as np
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from datetime import datetime
+
+# ============== 参数 ==============
+DATA_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+MODEL_OUTDIR = "/content/"
+
+
+os.makedirs(MODEL_OUTDIR, exist_ok=True)
+
+# ============== 1. 加载数据 ==============
+npz = np.load(DATA_PATH, allow_pickle=True)
+X_raw = npz["X"].astype(np.float32)
+y = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+print(f"Loaded data: X={X_raw.shape}, y={y.shape}, features={len(channels_raw)}")
+
+# ============== 2. 特征筛选 ==============
+drop_list = {"ERA5LMAIN.T2M", "ERA5LMAIN.STL1", "ERA5LMAIN.TD", 'META.CITY_ID'}
+keep_idx, dropped = [], []
+
+for i, ch in enumerate(channels_raw):
+    if ch.upper().startswith("LST."):  # 防止信息泄漏
+        dropped.append(ch)
+    elif ch in drop_list:
+        dropped.append(ch)
+    else:
+        keep_idx.append(i)
+
+X = X_raw[:, keep_idx]
+channels = [channels_raw[i] for i in keep_idx]
+print(f"Kept {len(channels)} features: {channels}")
+print(f"Dropped {len(dropped)} features: {dropped}")
+
+# 去除无效值
+mask = np.isfinite(y)
+X, y = X[mask], y[mask]
+
+# ============== 3. 划分数据集 ==============
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=RANDOM_SEED)
+train_pool = Pool(X_train, y_train, feature_names=channels)
+val_pool = Pool(X_val, y_val, feature_names=channels)
+
+# ============== 4. 训练模型 ==============
+try:
+    model = CatBoostRegressor(
+        iterations=10000,
+        depth=8,
+        learning_rate=0.1,
+        l2_leaf_reg=3.0,
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        random_seed=RANDOM_SEED,
+        task_type="GPU",
+        devices="0",
+        od_type="Iter",
+        od_wait=200,
+        verbose=200
+    )
+    use_gpu = True
+except:
+    model = CatBoostRegressor(
+        iterations=3000,
+        depth=8,
+        learning_rate=0.03,
+        l2_leaf_reg=3.0,
+        loss_function="RMSE",
+        eval_metric="RMSE",
+        random_seed=RANDOM_SEED,
+        od_type="Iter",
+        od_wait=200,
+        verbose=200
+    )
+    use_gpu = False
+
+print("Using GPU?", use_gpu)
+model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+
+# ===== 6) 评估 =====
+def evaluate(m, Xv, yv, name="valid"):
+    p = m.predict(Xv)
+    rmse = mean_squared_error(yv, p) ** 0.5   # 兼容旧版 sklearn
+    mae  = mean_absolute_error(yv, p)
+    r2   = r2_score(yv, p)
+    print(f"[{name}] RMSE={rmse:.4f}  MAE={mae:.4f}  R2={r2:.4f}")
+    return {"rmse": float(rmse), "mae": float(mae), "r2": float(r2)}
+
+mtr = evaluate(model, X_tr, y_tr, "train")
+mva = evaluate(model, X_va, y_va, "valid")
+
+# ============== 6. 绘制重要性图 ==============
+importances = model.get_feature_importance()
+sorted_idx = np.argsort(importances)[::-1]
+topk = min(15, len(channels))
+
+plt.figure(figsize=(8,6))
+plt.barh(np.array(channels)[sorted_idx][:topk][::-1], importances[sorted_idx][:topk][::-1])
+plt.title("Feature Importance (Top 15)")
+plt.xlabel("Importance")
+plt.tight_layout()
+plt.show()
+
+# ============== 7. 保存模型与结果 ==============
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUT_DIR = os.path.join(MODEL_OUTDIR, f"GZ_model_{stamp}")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+model.save_model(os.path.join(OUT_DIR, "catboost_model.cbm"))
+np.save(os.path.join(OUT_DIR, "channels.npy"), np.array(channels, dtype=object))
+np.save(os.path.join(OUT_DIR, "X_valid.npy"), X_val)
+np.save(os.path.join(OUT_DIR, "y_valid.npy"), y_val)
+with open(os.path.join(OUT_DIR, "metrics.json"), "w") as f:
+    json.dump({"train": mtr, "valid": mva, "use_gpu": use_gpu,
+               "dropped": list(map(str, dropped))}, f, indent=2)
+
+print(f"✅ 模型与验证数据已保存至: {OUT_DIR}")
+
