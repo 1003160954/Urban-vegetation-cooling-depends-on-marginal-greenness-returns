@@ -1,0 +1,3094 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# FAST matched observational perturbation benchmark
+# Target runtime: ~3–5 min in Colab
+#
+# Core idea:
+#   Avoid slow pixel-level kNN.
+#   Aggregate within city-year-month and greenness bins.
+#
+# For each city-year-month:
+#   low greenness reference = lowest REF_Q of EVI/LAI
+#   target bins = global EVI/LAI quantile bins
+#
+# Keep target bins whose non-vegetation background is similar
+# to the low-greenness reference.
+#
+# Cooling benefit = mean LST anomaly of low-greenness reference
+#                 - mean LST anomaly of target greenness bin
+#
+# Positive value means target greenness bin is cooler than
+# matched low-greenness reference under similar background.
+# ============================================================
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0. Paths and fast settings
+# ============================================================
+
+DATA_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised/section6_7_fast_matched_observed_benchmark"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+rng = np.random.default_rng(RANDOM_SEED)
+
+VEG_FEATURES = ["EVI.EVI", "LAI.LAI"]
+GROUP_COLS = ["sample_city_id", "sample_year", "sample_month"]
+
+# Fast controls
+MAX_PER_GROUP = 120        # keep at most 120 samples per city-year-month
+MIN_GROUP_N = 25
+MIN_REF_N = 5
+MIN_TARGET_N = 5
+
+N_BINS = 10
+REF_Q = 0.25
+
+# Similarity threshold in standardized control-difference space.
+# Smaller = stricter, fewer matches. Larger = more coverage, less strict.
+MAX_BACKGROUND_DISTANCE = 1.50
+
+# To make it faster, keep all groups but sample per group.
+# If still slow, lower MAX_PER_GROUP to 80.
+CONTROL_PATTERNS = {
+    "VPD":  ["VPD"],
+    "SSRD": ["SSRD", "SWDOWN", "SHORTWAVE"],
+    "TP":   ["TP", "PRECIP", "PRCP"],
+    "DEM":  ["DEM"],
+    "LC":   ["LC"],
+    "NTL":  ["NTL"],
+}
+
+REGIME_PATTERNS = {
+    "VPD":  ["VPD"],
+    "SSRD": ["SSRD", "SWDOWN", "SHORTWAVE"],
+}
+
+# ============================================================
+# 1. Load data
+# ============================================================
+
+npz = np.load(DATA_PATH, allow_pickle=True)
+
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+meta_keys = [
+    "sample_city_id", "sample_city_name", "sample_year", "sample_month",
+    "sample_row", "sample_col", "sample_yyyymm"
+]
+
+meta = {}
+for k in meta_keys:
+    if k in npz.files:
+        meta[k] = npz[k]
+
+mask = np.isfinite(y_raw)
+X_raw = X_raw[mask]
+y = y_raw[mask]
+
+for k in list(meta.keys()):
+    meta[k] = meta[k][mask]
+
+df = pd.DataFrame(X_raw, columns=channels_raw)
+df["LST_obs"] = y
+
+for k in ["sample_city_id", "sample_year", "sample_month"]:
+    if k not in meta:
+        raise ValueError(f"Missing metadata: {k}")
+
+df["sample_city_id"] = meta["sample_city_id"].astype(int)
+df["sample_year"] = meta["sample_year"].astype(int)
+df["sample_month"] = meta["sample_month"].astype(int)
+
+if "sample_city_name" in meta:
+    df["sample_city_name"] = meta["sample_city_name"].astype(str)
+else:
+    df["sample_city_name"] = df["sample_city_id"].astype(str)
+
+print("Loaded df:", df.shape)
+print("Channels:", channels_raw)
+
+# ============================================================
+# 2. Utilities
+# ============================================================
+
+def find_col_by_patterns(columns, patterns, required=False):
+    for pat in patterns:
+        for c in columns:
+            if pat.lower() in str(c).lower():
+                return c
+    if required:
+        raise ValueError(f"Cannot find column matching patterns: {patterns}")
+    return None
+
+
+def get_control_cols(df_in):
+    cols = []
+    mapping = {}
+
+    for name, pats in CONTROL_PATTERNS.items():
+        c = find_col_by_patterns(df_in.columns, pats, required=False)
+        if c is not None:
+            x = pd.to_numeric(df_in[c], errors="coerce")
+            if np.isfinite(x).mean() > 0.30:
+                cols.append(c)
+                mapping[name] = c
+
+    cols = list(dict.fromkeys(cols))
+    return cols, mapping
+
+
+def group_preserving_sample(df_in, max_per_group=120):
+    parts = []
+    for _, g in df_in.groupby(GROUP_COLS, sort=False):
+        if len(g) > max_per_group:
+            parts.append(g.sample(n=max_per_group, random_state=RANDOM_SEED))
+        else:
+            parts.append(g)
+    return pd.concat(parts, ignore_index=True)
+
+
+def prepare_data(df_in, control_cols):
+    out = df_in.copy()
+
+    for feat in VEG_FEATURES:
+        if feat in out.columns:
+            upper = 1 if "EVI" in feat else 8
+            out[feat] = pd.to_numeric(out[feat], errors="coerce").clip(0, upper)
+
+    out["group_key"] = (
+        out["sample_city_id"].astype(str) + "_" +
+        out["sample_year"].astype(str) + "_" +
+        out["sample_month"].astype(str)
+    )
+
+    group_mean = out.groupby(GROUP_COLS)["LST_obs"].transform("mean")
+    group_n = out.groupby(GROUP_COLS)["LST_obs"].transform("count")
+
+    out["LST_anom_cym"] = out["LST_obs"] - group_mean
+    out["Cooling_anom_cym"] = -out["LST_anom_cym"]
+    out["n_group_cym"] = group_n
+
+    # numeric controls
+    for c in control_cols:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out = out[out["n_group_cym"] >= MIN_GROUP_N].copy()
+
+    return out
+
+
+def add_background_regimes(df_in):
+    out = df_in.copy()
+
+    for name, pats in REGIME_PATTERNS.items():
+        col = find_col_by_patterns(out.columns, pats, required=False)
+        if col is None:
+            continue
+
+        bg = out.groupby(GROUP_COLS)[col].transform("mean")
+        q1 = np.nanquantile(bg, 1/3)
+        q2 = np.nanquantile(bg, 2/3)
+
+        out[f"{name}_group_mean"] = bg
+        out[f"{name}_regime"] = "Mid"
+        out.loc[bg <= q1, f"{name}_regime"] = "Low"
+        out.loc[bg >= q2, f"{name}_regime"] = "High"
+
+    return out
+
+
+def make_bins(data, feat, n_bins=10):
+    x = pd.to_numeric(data[feat], errors="coerce")
+    x = x[np.isfinite(x) & (x > 0)]
+
+    edges = np.unique(np.quantile(x, np.linspace(0, 1, n_bins + 1)))
+    if len(edges) < 4:
+        raise ValueError(f"Too few unique bin edges for {feat}")
+
+    edges[0] -= 1e-8
+    edges[-1] += 1e-8
+    return edges
+
+
+def weighted_mean(x, w):
+    x = np.asarray(x, dtype=float)
+    w = np.asarray(w, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(w) & (w > 0)
+    if ok.sum() == 0:
+        return np.nan
+    return float(np.sum(x[ok] * w[ok]) / np.sum(w[ok]))
+
+
+# ============================================================
+# 3. Prepare sampled data
+# ============================================================
+
+control_cols, control_mapping = get_control_cols(df)
+
+print("\nDetected controls:")
+print(control_cols)
+print(control_mapping)
+
+if len(control_cols) < 3:
+    raise ValueError("Too few controls detected.")
+
+df = group_preserving_sample(df, max_per_group=MAX_PER_GROUP)
+print("After group-preserving sampling:", df.shape)
+
+df = prepare_data(df, control_cols)
+df = add_background_regimes(df)
+
+veg_features = [f for f in VEG_FEATURES if f in df.columns]
+
+print("After preparation:", df.shape)
+print("Vegetation features:", veg_features)
+
+# Save settings
+settings = {
+    "MAX_PER_GROUP": MAX_PER_GROUP,
+    "MIN_GROUP_N": MIN_GROUP_N,
+    "MIN_REF_N": MIN_REF_N,
+    "MIN_TARGET_N": MIN_TARGET_N,
+    "N_BINS": N_BINS,
+    "REF_Q": REF_Q,
+    "MAX_BACKGROUND_DISTANCE": MAX_BACKGROUND_DISTANCE,
+    "control_cols": control_cols,
+    "control_mapping": control_mapping,
+}
+
+with open(os.path.join(OUT_DIR, "fast_matched_benchmark_settings.json"), "w") as f:
+    json.dump(settings, f, indent=2)
+
+# ============================================================
+# 4. Fast matched observed response
+# ============================================================
+
+def fast_matched_response(data, feat, control_cols, regime_col=None, regime_value=None):
+    d = data.copy()
+
+    if regime_col is not None and regime_value is not None:
+        d = d[d[regime_col] == regime_value].copy()
+
+    use_cols = ["group_key", feat, "LST_anom_cym"] + control_cols
+    d = d[use_cols].replace([np.inf, -np.inf], np.nan).dropna()
+    d = d[d[feat] > 0].copy()
+
+    if len(d) < 1000:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Reference threshold within each city-year-month
+    ref_thr = d.groupby("group_key")[feat].transform(lambda x: x.quantile(REF_Q))
+    d["is_ref"] = d[feat] <= ref_thr
+
+    # Global greenness bins
+    edges = make_bins(d, feat, n_bins=N_BINS)
+    d["bin_id"] = pd.cut(
+        d[feat],
+        bins=edges,
+        labels=False,
+        include_lowest=True
+    )
+
+    # reference stats by group
+    ref = d[d["is_ref"]].copy()
+    if ref.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    ref_agg_dict = {
+        "LST_anom_cym": ["mean", "count"],
+        feat: "mean"
+    }
+    for c in control_cols:
+        ref_agg_dict[c] = "mean"
+
+    ref_stats = ref.groupby("group_key").agg(ref_agg_dict)
+    ref_stats.columns = [
+        "ref_" + "_".join([str(x) for x in col if x != ""])
+        for col in ref_stats.columns
+    ]
+    ref_stats = ref_stats.reset_index().rename(columns={
+        "ref_LST_anom_cym_mean": "ref_LST_anom",
+        "ref_LST_anom_cym_count": "n_ref",
+        f"ref_{feat}_mean": "ref_x_mean",
+    })
+
+    # target stats by group and target greenness bin
+    tgt = d.copy()
+    tgt = tgt.dropna(subset=["bin_id"])
+    tgt["bin_id"] = tgt["bin_id"].astype(int)
+
+    tgt_agg_dict = {
+        "LST_anom_cym": ["mean", "count"],
+        feat: "mean"
+    }
+    for c in control_cols:
+        tgt_agg_dict[c] = "mean"
+
+    tgt_stats = tgt.groupby(["group_key", "bin_id"]).agg(tgt_agg_dict)
+    tgt_stats.columns = [
+        "tgt_" + "_".join([str(x) for x in col if x != ""])
+        for col in tgt_stats.columns
+    ]
+    tgt_stats = tgt_stats.reset_index().rename(columns={
+        "tgt_LST_anom_cym_mean": "tgt_LST_anom",
+        "tgt_LST_anom_cym_count": "n_target",
+        f"tgt_{feat}_mean": "x_target_mean",
+    })
+
+    # merge target with low-greenness reference
+    m = tgt_stats.merge(ref_stats, on="group_key", how="inner")
+
+    m = m[(m["n_ref"] >= MIN_REF_N) & (m["n_target"] >= MIN_TARGET_N)].copy()
+
+    if m.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Standardized background distance between target bin and reference
+    dist_terms = []
+
+    for c in control_cols:
+        tgt_c = f"tgt_{c}_mean"
+        ref_c = f"ref_{c}_mean"
+
+        if tgt_c not in m.columns or ref_c not in m.columns:
+            continue
+
+        scale = np.nanstd(d[c].values)
+        if not np.isfinite(scale) or scale == 0:
+            continue
+
+        diff_std = (m[tgt_c] - m[ref_c]) / scale
+        dist_terms.append(diff_std.values ** 2)
+
+    if len(dist_terms) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    m["background_distance"] = np.sqrt(np.nanmean(np.vstack(dist_terms), axis=0))
+
+    # candidate vs matched coverage
+    m["is_matched"] = m["background_distance"] <= MAX_BACKGROUND_DISTANCE
+
+    # Cooling benefit: low-reference LST anomaly - target-bin LST anomaly
+    m["cooling_benefit"] = m["ref_LST_anom"] - m["tgt_LST_anom"]
+    m["weight"] = np.minimum(m["n_ref"], m["n_target"])
+
+    # summarize all candidate and matched bins
+    rows = []
+    diag_rows = []
+
+    for b, gb in m.groupby("bin_id"):
+        matched = gb[gb["is_matched"]].copy()
+
+        # bin center from observed target means
+        x_mean_all = weighted_mean(gb["x_target_mean"], gb["n_target"])
+
+        diag_rows.append({
+            "feature": feat,
+            "group_type": "All" if regime_col is None else regime_col.replace("_regime", ""),
+            "group": "All" if regime_value is None else str(regime_value),
+            "bin_id": int(b),
+            "x_target_mean_all_candidates": x_mean_all,
+            "n_candidate_groups": int(gb["group_key"].nunique()),
+            "n_candidate_samples": int(gb["n_target"].sum()),
+            "n_matched_groups": int(matched["group_key"].nunique()),
+            "n_matched_samples": int(matched["n_target"].sum()) if len(matched) else 0,
+            "coverage_group_frac": float(len(matched) / len(gb)) if len(gb) else np.nan,
+            "coverage_sample_frac": float(matched["n_target"].sum() / gb["n_target"].sum()) if len(gb) and gb["n_target"].sum() > 0 else np.nan,
+            "mean_background_distance_all": float(gb["background_distance"].mean()),
+            "mean_background_distance_matched": float(matched["background_distance"].mean()) if len(matched) else np.nan,
+        })
+
+        if len(matched) == 0:
+            continue
+
+        rows.append({
+            "feature": feat,
+            "group_type": "All" if regime_col is None else regime_col.replace("_regime", ""),
+            "group": "All" if regime_value is None else str(regime_value),
+            "bin_id": int(b),
+            "x_target_mean": weighted_mean(matched["x_target_mean"], matched["n_target"]),
+            "mean_cooling_benefit": weighted_mean(matched["cooling_benefit"], matched["weight"]),
+            "median_cooling_benefit": float(matched["cooling_benefit"].median()),
+            "q25_cooling_benefit": float(matched["cooling_benefit"].quantile(0.25)),
+            "q75_cooling_benefit": float(matched["cooling_benefit"].quantile(0.75)),
+            "cooling_se_group": float(matched["cooling_benefit"].std() / np.sqrt(len(matched))) if len(matched) > 1 else np.nan,
+            "frac_positive_cooling_group": float((matched["cooling_benefit"] > 0).mean()),
+            "n_matched_groups": int(matched["group_key"].nunique()),
+            "n_matched_samples": int(matched["n_target"].sum()),
+            "mean_background_distance": float(matched["background_distance"].mean()),
+            "coverage_group_frac": float(len(matched) / len(gb)),
+            "coverage_sample_frac": float(matched["n_target"].sum() / gb["n_target"].sum()) if gb["n_target"].sum() > 0 else np.nan,
+        })
+
+    return pd.DataFrame(rows), pd.DataFrame(diag_rows)
+
+
+all_resp = []
+all_diag = []
+
+for feat in veg_features:
+    print(f"\nRunning FAST matched response: {feat} | All")
+    resp, diag = fast_matched_response(df, feat, control_cols)
+    print("  response:", resp.shape, "diagnostic:", diag.shape)
+    all_resp.append(resp)
+    all_diag.append(diag)
+
+    for regime_col in ["VPD_regime", "SSRD_regime"]:
+        if regime_col in df.columns:
+            for reg in ["Low", "Mid", "High"]:
+                print(f"Running FAST matched response: {feat} | {regime_col}={reg}")
+                resp, diag = fast_matched_response(df, feat, control_cols, regime_col, reg)
+                print("  response:", resp.shape, "diagnostic:", diag.shape)
+                all_resp.append(resp)
+                all_diag.append(diag)
+
+response_df = pd.concat([x for x in all_resp if x is not None and not x.empty], ignore_index=True)
+diag_df = pd.concat([x for x in all_diag if x is not None and not x.empty], ignore_index=True)
+
+response_df.to_csv(os.path.join(OUT_DIR, "fast_matched_observed_response_curves.csv"), index=False)
+diag_df.to_csv(os.path.join(OUT_DIR, "fast_matched_observed_coverage_diagnostics.csv"), index=False)
+
+print("\nFinal response_df:", response_df.shape)
+print("Final diag_df:", diag_df.shape)
+
+# ============================================================
+# 5. Marginal efficiency and summary
+# ============================================================
+
+def compute_marginal(response_df):
+    rows = []
+
+    for keys, sub in response_df.groupby(["feature", "group_type", "group"]):
+        feat, gtype, group = keys
+        sub = sub.sort_values("x_target_mean").reset_index(drop=True)
+
+        if len(sub) < 4:
+            continue
+
+        x = sub["x_target_mean"].values
+        y = sub["mean_cooling_benefit"].values
+
+        dx = np.diff(x)
+        dy = np.diff(y)
+
+        eff = np.full(len(dx), np.nan)
+        ok = dx != 0
+        eff[ok] = dy[ok] / dx[ok]
+        eff_smooth = pd.Series(eff).rolling(3, center=True, min_periods=1).mean().values
+
+        for i in range(len(eff)):
+            rows.append({
+                "feature": feat,
+                "group_type": gtype,
+                "group": group,
+                "x_mid": float((x[i] + x[i+1]) / 2),
+                "marginal_efficiency": float(eff[i]),
+                "marginal_efficiency_smooth": float(eff_smooth[i]),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def summarize_response(response_df, diag_df):
+    rows = []
+
+    for keys, sub in response_df.groupby(["feature", "group_type", "group"]):
+        feat, gtype, group = keys
+        sub = sub.sort_values("x_target_mean")
+
+        max_benefit = sub["mean_cooling_benefit"].max()
+        x_max = sub.loc[sub["mean_cooling_benefit"].idxmax(), "x_target_mean"]
+        final_benefit = sub["mean_cooling_benefit"].iloc[-1]
+        final_x = sub["x_target_mean"].iloc[-1]
+
+        diag = diag_df[
+            (diag_df["feature"] == feat) &
+            (diag_df["group_type"] == gtype) &
+            (diag_df["group"] == group)
+        ]
+
+        rows.append({
+            "feature": feat,
+            "group_type": gtype,
+            "group": group,
+            "n_bins_matched": int(len(sub)),
+            "max_matched_cooling_benefit": float(max_benefit),
+            "x_at_max_benefit": float(x_max),
+            "final_cooling_benefit": float(final_benefit),
+            "final_x": float(final_x),
+            "mean_coverage_group_frac": float(sub["coverage_group_frac"].mean()),
+            "min_coverage_group_frac": float(sub["coverage_group_frac"].min()),
+            "mean_coverage_sample_frac": float(sub["coverage_sample_frac"].mean()),
+            "mean_background_distance": float(sub["mean_background_distance"].mean()),
+            "total_matched_samples": int(sub["n_matched_samples"].sum()),
+            "total_matched_groups": int(sub["n_matched_groups"].sum()),
+            "candidate_bins": int(len(diag)),
+        })
+
+    return pd.DataFrame(rows)
+
+
+slope_df = compute_marginal(response_df)
+summary_df = summarize_response(response_df, diag_df)
+
+slope_df.to_csv(os.path.join(OUT_DIR, "fast_matched_observed_marginal_efficiency.csv"), index=False)
+summary_df.to_csv(os.path.join(OUT_DIR, "fast_matched_observed_summary.csv"), index=False)
+
+print("\n=== FAST matched observed summary ===")
+print(summary_df.to_string(index=False))
+
+# ============================================================
+# 6. Plot figures
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 140,
+    "savefig.dpi": 300,
+})
+
+colors = {
+    "All": "#1F2937",
+    "Low": "#4C78A8",
+    "Mid": "#7A7A7A",
+    "High": "#B85C38",
+}
+
+# Figure 1: response curves
+fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.8))
+axes = axes.ravel()
+
+for i, feat in enumerate(veg_features[:2]):
+    ax = axes[i]
+    sub = response_df[
+        (response_df["feature"] == feat) &
+        (response_df["group_type"] == "All") &
+        (response_df["group"] == "All")
+    ].sort_values("x_target_mean")
+
+    if not sub.empty:
+        ax.plot(
+            sub["x_target_mean"], sub["mean_cooling_benefit"],
+            marker="o", linewidth=2.2, markersize=4,
+            color=colors["All"]
+        )
+
+        ax.fill_between(
+            sub["x_target_mean"],
+            sub["mean_cooling_benefit"] - 1.96 * sub["cooling_se_group"],
+            sub["mean_cooling_benefit"] + 1.96 * sub["cooling_se_group"],
+            color=colors["All"], alpha=0.14
+        )
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+    ax.set_xlabel(feat)
+    ax.set_ylabel("Matched cooling benefit (°C)")
+    ax.set_title(f"{chr(97+i)}  Fast matched observed response: {feat}", loc="left", fontweight="bold")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+for i, feat in enumerate(veg_features[:2]):
+    ax = axes[2+i]
+    for reg in ["Low", "Mid", "High"]:
+        sub = response_df[
+            (response_df["feature"] == feat) &
+            (response_df["group_type"] == "VPD") &
+            (response_df["group"] == reg)
+        ].sort_values("x_target_mean")
+
+        if sub.empty:
+            continue
+
+        ax.plot(
+            sub["x_target_mean"], sub["mean_cooling_benefit"],
+            marker="o", linewidth=2.0, markersize=3.5,
+            color=colors[reg], label=reg
+        )
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+    ax.set_xlabel(feat)
+    ax.set_ylabel("Matched cooling benefit (°C)")
+    ax.set_title(f"{chr(99+i)}  Fast matched response by VPD", loc="left", fontweight="bold")
+    ax.legend(frameon=False, title="VPD")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+plt.tight_layout()
+fig1_png = os.path.join(OUT_DIR, "FigS_fast_matched_observed_response.png")
+fig1_pdf = os.path.join(OUT_DIR, "FigS_fast_matched_observed_response.pdf")
+fig.savefig(fig1_png, dpi=300, bbox_inches="tight")
+fig.savefig(fig1_pdf, bbox_inches="tight")
+plt.show()
+
+# Figure 2: coverage diagnostics
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6))
+
+for i, feat in enumerate(veg_features[:2]):
+    ax = axes[i]
+
+    sub = diag_df[
+        (diag_df["feature"] == feat) &
+        (diag_df["group_type"] == "All") &
+        (diag_df["group"] == "All")
+    ].sort_values("x_target_mean_all_candidates")
+
+    if sub.empty:
+        continue
+
+    ax.plot(
+        sub["x_target_mean_all_candidates"],
+        sub["coverage_group_frac"],
+        marker="o", linewidth=2.0,
+        color="#365C6A", label="Group coverage"
+    )
+
+    ax.plot(
+        sub["x_target_mean_all_candidates"],
+        sub["coverage_sample_frac"],
+        marker="s", linewidth=2.0,
+        color="#B85C38", label="Sample coverage"
+    )
+
+    ax.set_ylim(0, 1.05)
+    ax.set_xlabel(feat)
+    ax.set_ylabel("Matching coverage")
+    ax.set_title(f"{chr(97+i)}  Observation-only coverage: {feat}", loc="left", fontweight="bold")
+    ax.legend(frameon=False)
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+plt.tight_layout()
+fig2_png = os.path.join(OUT_DIR, "FigS_fast_matched_observed_coverage.png")
+fig2_pdf = os.path.join(OUT_DIR, "FigS_fast_matched_observed_coverage.pdf")
+fig.savefig(fig2_png, dpi=300, bbox_inches="tight")
+fig.savefig(fig2_pdf, bbox_inches="tight")
+plt.show()
+
+# Figure 3: marginal efficiency
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.6))
+
+for i, feat in enumerate(veg_features[:2]):
+    ax = axes[i]
+
+    sub = slope_df[
+        (slope_df["feature"] == feat) &
+        (slope_df["group_type"] == "All") &
+        (slope_df["group"] == "All")
+    ].sort_values("x_mid")
+
+    if sub.empty:
+        continue
+
+    ax.plot(
+        sub["x_mid"],
+        sub["marginal_efficiency_smooth"],
+        marker="o", linewidth=2.0,
+        color="#365C6A"
+    )
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+    ax.set_xlabel(feat)
+    ax.set_ylabel("Matched marginal cooling efficiency\n(°C per unit greenness)")
+    ax.set_title(f"{chr(97+i)}  Fast matched marginal response: {feat}", loc="left", fontweight="bold")
+    ax.grid(True, linestyle=":", alpha=0.3)
+
+plt.tight_layout()
+fig3_png = os.path.join(OUT_DIR, "FigS_fast_matched_observed_marginal_efficiency.png")
+fig3_pdf = os.path.join(OUT_DIR, "FigS_fast_matched_observed_marginal_efficiency.pdf")
+fig.savefig(fig3_png, dpi=300, bbox_inches="tight")
+fig.savefig(fig3_pdf, bbox_inches="tight")
+plt.show()
+
+# ============================================================
+# 7. Report
+# ============================================================
+
+report_path = os.path.join(OUT_DIR, "fast_matched_observed_numeric_report.txt")
+
+with open(report_path, "w") as f:
+    f.write("FAST matched observational perturbation benchmark\n")
+    f.write("================================================\n\n")
+    f.write("Purpose:\n")
+    f.write(
+        "This fast observation-only benchmark approximates the all-else-fixed logic of ML perturbation "
+        "by comparing target greenness-bin LST anomalies with low-greenness reference anomalies within "
+        "the same city-year-month and retaining only group-bin pairs with similar non-vegetation backgrounds.\n\n"
+    )
+    f.write("Settings:\n")
+    f.write(json.dumps(settings, indent=2))
+    f.write("\n\n")
+    f.write("Summary:\n")
+    f.write(summary_df.to_string(index=False))
+    f.write("\n\n")
+    f.write("Interpretation:\n")
+    f.write(
+        "Positive matched cooling benefit indicates that target greenness bins are cooler than "
+        "similar-background low-greenness references. Coverage diagnostics show where observation-only "
+        "matching has limited support, which motivates the distribution-constrained ML perturbation approach.\n"
+    )
+
+print("Saved report:", report_path)
+
+print("\n============================================================")
+print("MANUSCRIPT-READY NUMERIC FACTS")
+print("============================================================")
+print(summary_df.to_string(index=False))
+print("\nAll outputs saved to:")
+print(OUT_DIR)
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Observed trajectory matching analogue of ML timing-shift metrics
+#
+# Goal:
+#   Find a representative city-year where early-EVI and late-EVI trajectories
+#   have similar climate/static/EVI-amount/pre-LST backgrounds,
+#   then compare the same metrics used in ML counterfactual simulation:
+#
+#   1) warm-season P95 LST anomaly
+#   2) cumulative heat load
+#   3) peak timing
+#
+# Sign convention, aligned with ML simulation:
+#   observed_d_warm_p95  = early_P95 - late_P95
+#   observed_d_heat_load = early_heat_load - late_heat_load
+#   observed_d_peak_time = early_peak_time - late_peak_time
+#
+# Interpretation:
+#   d_warm_p95 < 0   => early EVI is cooler for P95
+#   d_heat_load < 0  => early EVI has lower heat load
+#   d_peak_time > 0  => early EVI delays LST peak
+#
+# This is an observed matched analogue, not causal proof.
+# ============================================================
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0. Paths and settings
+# ============================================================
+
+DATA_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised/section6_10_observed_matching_ML_metrics"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+rng = np.random.default_rng(RANDOM_SEED)
+
+TIMING_FEATURE = "EVI.EVI"
+
+# Months
+TRAJ_MONTHS = [3, 4, 5, 6, 7, 8, 9]
+WARM_MONTHS = [6, 7, 8]
+PRE_MONTHS  = [3, 4, 5]
+CLIM_MONTHS = [3, 4, 5, 6, 7, 8, 9]
+
+MONTH_TO_DOY = {
+    1: 15, 2: 45, 3: 75, 4: 105, 5: 135, 6: 165,
+    7: 195, 8: 225, 9: 255, 10: 285, 11: 315, 12: 345
+}
+
+# Early / late definition
+EARLY_Q = 0.30
+LATE_Q  = 0.70
+
+# Speed controls
+MAX_PIXEL_YEARS_PER_CITY_YEAR = 700
+MAX_CITY_YEARS_TO_SCAN = 300
+MIN_PIXEL_YEARS_CITY_YEAR = 120
+
+MAX_EARLY_PER_CITY_YEAR = 100
+MAX_LATE_PER_CITY_YEAR = 250
+
+# Matching controls
+K_CANDIDATES = 20
+MAX_CONTROL_DISTANCE = 7.5
+
+# Shape filtering
+USE_SHAPE_FILTER = True
+MAX_EVI_SHAPE_RMSE = 0.12
+MIN_SHAPE_OVERLAP = 5
+
+# Minimum successful pairs per city-year
+MIN_MATCHED_PAIRS = 25
+
+# For heat load; monthly approximation
+MONTH_DAYS = 30.0
+
+CONTROL_PATTERNS = {
+    "DEM":  ["DEM"],
+    "LC":   ["LC"],
+    "NTL":  ["NTL"],
+    "VPD":  ["VPD"],
+    "SSRD": ["SSRD", "SWDOWN", "SHORTWAVE"],
+    "TP":   ["TP", "PRECIP", "PRCP"],
+}
+
+# ============================================================
+# 1. Load data
+# ============================================================
+
+npz = np.load(DATA_PATH, allow_pickle=True)
+
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+meta_keys = [
+    "sample_city_id", "sample_city_name", "sample_year",
+    "sample_month", "sample_row", "sample_col"
+]
+
+meta = {}
+for k in meta_keys:
+    if k in npz.files:
+        meta[k] = npz[k]
+
+for k in ["sample_city_id", "sample_year", "sample_month", "sample_row", "sample_col"]:
+    if k not in meta:
+        raise ValueError(f"Missing required metadata: {k}")
+
+mask = np.isfinite(y_raw)
+X_raw = X_raw[mask]
+y = y_raw[mask]
+
+for k in list(meta.keys()):
+    meta[k] = meta[k][mask]
+
+df = pd.DataFrame(X_raw, columns=channels_raw)
+df["LST_obs"] = y
+
+df["sample_city_id"] = meta["sample_city_id"].astype(np.int32)
+df["sample_year"] = meta["sample_year"].astype(np.int16)
+df["sample_month"] = meta["sample_month"].astype(np.int8)
+df["sample_row"] = meta["sample_row"].astype(np.int32)
+df["sample_col"] = meta["sample_col"].astype(np.int32)
+
+if "sample_city_name" in meta:
+    df["sample_city_name"] = meta["sample_city_name"].astype(str)
+else:
+    df["sample_city_name"] = df["sample_city_id"].astype(str)
+
+print("Loaded df:", df.shape)
+print("Channels:", channels_raw)
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+def find_col_by_patterns(columns, patterns):
+    for pat in patterns:
+        for c in columns:
+            if pat.lower() in str(c).lower():
+                return c
+    return None
+
+def get_colmap(df_in):
+    return {k: find_col_by_patterns(df_in.columns, v) for k, v in CONTROL_PATTERNS.items()}
+
+def interpolate_rows(mat):
+    tmp = pd.DataFrame(mat).interpolate(axis=1, limit_direction="both").values.astype(float)
+    row_mean = np.nanmean(tmp, axis=1)
+    bad = ~np.isfinite(tmp)
+    if bad.any():
+        inds = np.where(bad)
+        tmp[inds] = np.take(row_mean, inds[0])
+    return tmp
+
+def rowwise_onset(evi_wide):
+    mat0 = evi_wide.values.astype(float)
+    valid_count = np.isfinite(mat0).sum(axis=1)
+
+    mat = interpolate_rows(mat0)
+
+    left = np.concatenate([mat[:, [0]], mat[:, :-1]], axis=1)
+    right = np.concatenate([mat[:, 1:], mat[:, [-1]]], axis=1)
+    sm = (left + mat + right) / 3.0
+
+    diff = np.diff(sm, axis=1)
+    maxdiff = np.nanmax(diff, axis=1)
+    idx = np.nanargmax(diff, axis=1)
+
+    onset = idx + 2
+    onset = onset.astype(float)
+    onset[(valid_count < 6) | (maxdiff <= 0)] = np.nan
+
+    return onset
+
+def shift_late_curve_earlier(late_curve, onset_gap):
+    """
+    Shift late EVI curve earlier by onset_gap months.
+    """
+    d = int(round(onset_gap))
+    shifted = np.full_like(late_curve, np.nan, dtype=float)
+
+    if d <= 0:
+        return late_curve.copy()
+
+    if d >= len(late_curve):
+        return shifted
+
+    shifted[:-d] = late_curve[d:]
+    return shifted
+
+def evi_shape_rmse_after_shift(early_curve, late_curve, onset_gap):
+    shifted = shift_late_curve_earlier(late_curve, onset_gap)
+    ok = np.isfinite(early_curve) & np.isfinite(shifted)
+
+    if ok.sum() < MIN_SHAPE_OVERLAP:
+        return np.nan
+
+    return float(np.sqrt(np.mean((early_curve[ok] - shifted[ok]) ** 2)))
+
+def robust_peak_time_month(values, months):
+    """
+    Robust peak time as mean month of top-2 LST anomaly values.
+    """
+    values = np.asarray(values, dtype=float)
+    months = np.asarray(months, dtype=float)
+
+    ok = np.isfinite(values)
+    values = values[ok]
+    months = months[ok]
+
+    if len(values) == 0:
+        return np.nan
+
+    k = min(2, len(values))
+    idx = np.argsort(values)[-k:]
+    peak_month = float(np.mean(months[idx]))
+    return peak_month
+
+def compute_observed_metrics(lst_month_values, warm_idx, all_months):
+    """
+    Compute metrics analogous to ML simulation, but on monthly observed LST anomaly.
+    """
+    x = np.asarray(lst_month_values, dtype=float)
+    months = np.asarray(all_months, dtype=int)
+
+    warm_x = x[warm_idx]
+
+    warm_p95 = float(np.nanpercentile(warm_x, 95))
+
+    # Heat load relative to 0 LST anomaly:
+    # positive LST anomaly months contribute to heat load.
+    heat_load = float(np.nansum(np.maximum(warm_x, 0)) * MONTH_DAYS)
+
+    peak_month = robust_peak_time_month(x, months)
+    peak_doy = float(MONTH_TO_DOY.get(int(round(peak_month)), np.nan)) if np.isfinite(peak_month) else np.nan
+
+    return {
+        "warm_p95": warm_p95,
+        "heat_load": heat_load,
+        "peak_month": peak_month,
+        "peak_doy": peak_doy,
+    }
+
+def standardized_mean_difference(a, b):
+    a = pd.to_numeric(pd.Series(a), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    b = pd.to_numeric(pd.Series(b), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+
+    sd = np.sqrt((np.var(a, ddof=1) + np.var(b, ddof=1)) / 2)
+    if sd == 0 or not np.isfinite(sd):
+        return np.nan
+
+    return float((np.mean(a) - np.mean(b)) / sd)
+
+# ============================================================
+# 3. Build monthly wide pixel-year table
+# ============================================================
+
+colmap = get_colmap(df)
+print("Detected columns:", colmap)
+
+if TIMING_FEATURE not in df.columns:
+    raise ValueError(f"Missing timing feature: {TIMING_FEATURE}")
+
+df[TIMING_FEATURE] = pd.to_numeric(df[TIMING_FEATURE], errors="coerce").clip(0, 1)
+
+if "LAI.LAI" in df.columns:
+    df["LAI.LAI"] = pd.to_numeric(df["LAI.LAI"], errors="coerce").clip(0, 8)
+
+# LST anomaly within city-year-month
+df["LST_anom_cym"] = (
+    df["LST_obs"] -
+    df.groupby(["sample_city_id", "sample_year", "sample_month"])["LST_obs"].transform("mean")
+)
+
+df["pixel_key"] = (
+    df["sample_city_id"].astype(str) + "_" +
+    df["sample_row"].astype(str) + "_" +
+    df["sample_col"].astype(str)
+)
+
+idx_cols = ["sample_city_id", "sample_city_name", "sample_year", "sample_row", "sample_col", "pixel_key"]
+
+need_cols = idx_cols + ["sample_month", "LST_anom_cym", TIMING_FEATURE]
+
+if "LAI.LAI" in df.columns:
+    need_cols.append("LAI.LAI")
+
+for key, c in colmap.items():
+    if c is not None and c in df.columns:
+        need_cols.append(c)
+
+need_cols = list(dict.fromkeys(need_cols))
+
+monthly = (
+    df[need_cols]
+    .groupby(idx_cols + ["sample_month"], sort=False)
+    .median(numeric_only=True)
+    .reset_index()
+)
+
+print("Monthly table:", monthly.shape)
+
+def make_wide(value_col, aggfunc="mean"):
+    w = monthly.pivot_table(
+        index=idx_cols,
+        columns="sample_month",
+        values=value_col,
+        aggfunc=aggfunc
+    )
+    for m in range(1, 13):
+        if m not in w.columns:
+            w[m] = np.nan
+    return w[range(1, 13)]
+
+evi_wide = make_wide(TIMING_FEATURE, "median")
+lst_wide = make_wide("LST_anom_cym", "mean")
+
+py = evi_wide.reset_index()[idx_cols].copy()
+py["t_EVI_onset_month"] = rowwise_onset(evi_wide)
+
+# EVI trajectory metrics
+py["annual_EVI_mean"] = evi_wide.mean(axis=1).values
+py["annual_EVI_max"] = evi_wide.max(axis=1).values
+py["annual_EVI_min"] = evi_wide.min(axis=1).values
+py["annual_EVI_amp"] = py["annual_EVI_max"] - py["annual_EVI_min"]
+py["spring_EVI_mean"] = evi_wide[PRE_MONTHS].mean(axis=1).values
+py["warm_EVI_mean"] = evi_wide[WARM_MONTHS].mean(axis=1).values
+
+# LST trajectory
+for m in TRAJ_MONTHS:
+    py[f"LST_m{m:02d}"] = lst_wide[m].values
+    py[f"EVI_m{m:02d}"] = evi_wide[m].values
+
+for m in range(1, 13):
+    py[f"EVI_full_m{m:02d}"] = evi_wide[m].values
+
+py["pre_LST_mean"] = lst_wide[PRE_MONTHS].mean(axis=1).values
+py["warm_LST_mean"] = lst_wide[WARM_MONTHS].mean(axis=1).values
+
+# Static controls
+static_cols = []
+for key in ["DEM", "LC", "NTL"]:
+    c = colmap.get(key)
+    if c is not None and c in monthly.columns:
+        static_cols.append(c)
+
+if static_cols:
+    stat = monthly.groupby(idx_cols, sort=False)[static_cols].median().reset_index()
+    py = py.merge(stat, on=idx_cols, how="left")
+
+# Climate monthly trajectory controls
+clim_cols = []
+for key in ["VPD", "SSRD", "TP"]:
+    c = colmap.get(key)
+    if c is not None and c in monthly.columns:
+        clim_cols.append(c)
+
+for c in clim_cols:
+    w = make_wide(c, "mean")
+
+    for m in CLIM_MONTHS:
+        py[f"{c}_m{m:02d}"] = w[m].values
+
+    py[f"spring_{c}"] = w[PRE_MONTHS].mean(axis=1).values
+    py[f"warm_{c}"] = w[WARM_MONTHS].mean(axis=1).values
+    py[f"traj_{c}_mean"] = w[TRAJ_MONTHS].mean(axis=1).values
+    py[f"traj_{c}_amp"] = (w[TRAJ_MONTHS].max(axis=1) - w[TRAJ_MONTHS].min(axis=1)).values
+
+# LAI optional amount metrics
+if "LAI.LAI" in monthly.columns:
+    lai_wide = make_wide("LAI.LAI", "median")
+    py["annual_LAI_mean"] = lai_wide.mean(axis=1).values
+    py["annual_LAI_max"] = lai_wide.max(axis=1).values
+    py["annual_LAI_amp"] = (lai_wide.max(axis=1) - lai_wide.min(axis=1)).values
+    py["warm_LAI_mean"] = lai_wide[WARM_MONTHS].mean(axis=1).values
+
+# Valid rows
+py = py.replace([np.inf, -np.inf], np.nan)
+py = py.dropna(subset=["t_EVI_onset_month", "warm_LST_mean", "pre_LST_mean"])
+
+print("Pixel-year table before cap:", py.shape)
+
+# Cap per city-year for speed
+parts = []
+for _, g in py.groupby(["sample_city_id", "sample_year"], sort=False):
+    if len(g) > MAX_PIXEL_YEARS_PER_CITY_YEAR:
+        parts.append(g.sample(n=MAX_PIXEL_YEARS_PER_CITY_YEAR, random_state=RANDOM_SEED))
+    else:
+        parts.append(g)
+
+py = pd.concat(parts, ignore_index=True)
+print("Pixel-year table after cap:", py.shape)
+
+py.to_csv(os.path.join(OUT_DIR, "pixel_year_trajectory_table.csv"), index=False)
+
+# ============================================================
+# 4. Controls for matching
+# ============================================================
+
+control_cols = []
+
+# static
+for c in static_cols:
+    if c in py.columns:
+        control_cols.append(c)
+
+# monthly climate trajectory
+for c in clim_cols:
+    for m in CLIM_MONTHS:
+        cc = f"{c}_m{m:02d}"
+        if cc in py.columns:
+            control_cols.append(cc)
+
+# pre-LST state
+control_cols.append("pre_LST_mean")
+
+# EVI amount, not full timing
+for c in ["annual_EVI_mean", "annual_EVI_max", "annual_EVI_amp", "warm_EVI_mean"]:
+    if c in py.columns:
+        control_cols.append(c)
+
+# optional LAI amount
+for c in ["annual_LAI_mean", "annual_LAI_max", "annual_LAI_amp", "warm_LAI_mean"]:
+    if c in py.columns:
+        control_cols.append(c)
+
+control_cols = list(dict.fromkeys(control_cols))
+
+control_cols = [
+    c for c in control_cols
+    if c in py.columns and np.isfinite(pd.to_numeric(py[c], errors="coerce")).mean() > 0.60
+]
+
+print("Matching controls:")
+print(control_cols)
+
+if len(control_cols) < 8:
+    raise ValueError("Too few matching controls.")
+
+# ============================================================
+# 5. Candidate city-years
+# ============================================================
+
+cy_count = (
+    py
+    .groupby(["sample_city_id", "sample_city_name", "sample_year"])
+    .size()
+    .reset_index(name="n")
+    .sort_values("n", ascending=False)
+)
+
+cy_count = cy_count[cy_count["n"] >= MIN_PIXEL_YEARS_CITY_YEAR].copy()
+
+if len(cy_count) > MAX_CITY_YEARS_TO_SCAN:
+    cy_count = cy_count.head(MAX_CITY_YEARS_TO_SCAN)
+
+print("Candidate city-years:", cy_count.shape)
+
+# ============================================================
+# 6. Match within one city-year
+# ============================================================
+
+evi_full_cols = [f"EVI_full_m{m:02d}" for m in range(1, 13)]
+evi_traj_cols = [f"EVI_m{m:02d}" for m in TRAJ_MONTHS]
+lst_traj_cols = [f"LST_m{m:02d}" for m in TRAJ_MONTHS]
+
+warm_idx = np.array([TRAJ_MONTHS.index(m) for m in WARM_MONTHS], dtype=int)
+months_arr = np.array(TRAJ_MONTHS, dtype=int)
+
+def match_one_city_year(g):
+    g = g.replace([np.inf, -np.inf], np.nan)
+    g = g.dropna(subset=["t_EVI_onset_month"] + control_cols + lst_traj_cols + evi_traj_cols)
+
+    if len(g) < MIN_PIXEL_YEARS_CITY_YEAR:
+        return None, None
+
+    q_early = g["t_EVI_onset_month"].quantile(EARLY_Q)
+    q_late = g["t_EVI_onset_month"].quantile(LATE_Q)
+
+    early = g[g["t_EVI_onset_month"] <= q_early].copy()
+    late = g[g["t_EVI_onset_month"] >= q_late].copy()
+
+    if len(early) < MIN_MATCHED_PAIRS or len(late) < MIN_MATCHED_PAIRS:
+        return None, None
+
+    if len(early) > MAX_EARLY_PER_CITY_YEAR:
+        early = early.sample(n=MAX_EARLY_PER_CITY_YEAR, random_state=RANDOM_SEED)
+
+    if len(late) > MAX_LATE_PER_CITY_YEAR:
+        late = late.sample(n=MAX_LATE_PER_CITY_YEAR, random_state=RANDOM_SEED)
+
+    scaler = StandardScaler()
+    scaler.fit(pd.concat([early[control_cols], late[control_cols]], axis=0).astype(float).values)
+
+    X_early = scaler.transform(early[control_cols].astype(float).values)
+    X_late = scaler.transform(late[control_cols].astype(float).values)
+
+    k = min(K_CANDIDATES, len(late))
+    nn = NearestNeighbors(n_neighbors=k)
+    nn.fit(X_late)
+
+    dist, idx = nn.kneighbors(X_early)
+
+    early_evi_full = early[evi_full_cols].values.astype(float)
+    late_evi_full = late[evi_full_cols].values.astype(float)
+
+    early_lst = early[lst_traj_cols].values.astype(float)
+    late_lst = late[lst_traj_cols].values.astype(float)
+
+    selected = []
+
+    for i in range(len(early)):
+        e_onset = early["t_EVI_onset_month"].iloc[i]
+        best = None
+
+        for kk in range(k):
+            j = idx[i, kk]
+            control_distance = dist[i, kk]
+
+            if control_distance > MAX_CONTROL_DISTANCE:
+                continue
+
+            l_onset = late["t_EVI_onset_month"].iloc[j]
+            onset_gap = l_onset - e_onset
+
+            if onset_gap <= 0:
+                continue
+
+            if USE_SHAPE_FILTER:
+                rmse = evi_shape_rmse_after_shift(
+                    early_evi_full[i],
+                    late_evi_full[j],
+                    onset_gap
+                )
+
+                if (not np.isfinite(rmse)) or (rmse > MAX_EVI_SHAPE_RMSE):
+                    continue
+            else:
+                rmse = np.nan
+
+            score = control_distance + 8.0 * (rmse if np.isfinite(rmse) else 0) + 0.10 * abs(onset_gap)
+
+            if best is None or score < best["score"]:
+                best = {
+                    "early_i": i,
+                    "late_j": j,
+                    "control_distance": control_distance,
+                    "evi_shape_rmse": rmse,
+                    "onset_gap": onset_gap,
+                    "score": score
+                }
+
+        if best is not None:
+            selected.append(best)
+
+    if len(selected) < MIN_MATCHED_PAIRS:
+        return None, None
+
+    pair_rows = []
+
+    for s in selected:
+        i = s["early_i"]
+        j = s["late_j"]
+
+        e = early.iloc[i]
+        l = late.iloc[j]
+
+        e_lst = early_lst[i]
+        l_lst = late_lst[j]
+
+        e_met = compute_observed_metrics(e_lst, warm_idx, months_arr)
+        l_met = compute_observed_metrics(l_lst, warm_idx, months_arr)
+
+        row = {
+            "sample_city_id": int(e["sample_city_id"]),
+            "sample_city_name": str(e["sample_city_name"]),
+            "sample_year": int(e["sample_year"]),
+            "early_pixel_key": e["pixel_key"],
+            "late_pixel_key": l["pixel_key"],
+
+            "early_onset_month": float(e["t_EVI_onset_month"]),
+            "late_onset_month": float(l["t_EVI_onset_month"]),
+            "onset_gap_months": float(s["onset_gap"]),
+
+            "control_distance": float(s["control_distance"]),
+            "evi_shape_rmse": float(s["evi_shape_rmse"]) if np.isfinite(s["evi_shape_rmse"]) else np.nan,
+            "match_score": float(s["score"]),
+
+            "early_warm_p95": e_met["warm_p95"],
+            "late_warm_p95": l_met["warm_p95"],
+            "observed_d_warm_p95": e_met["warm_p95"] - l_met["warm_p95"],
+            "observed_cooling_p95": l_met["warm_p95"] - e_met["warm_p95"],
+
+            "early_heat_load": e_met["heat_load"],
+            "late_heat_load": l_met["heat_load"],
+            "observed_d_heat_load": e_met["heat_load"] - l_met["heat_load"],
+            "observed_cooling_heat_load": l_met["heat_load"] - e_met["heat_load"],
+
+            "early_peak_doy": e_met["peak_doy"],
+            "late_peak_doy": l_met["peak_doy"],
+            "observed_d_peak_time": e_met["peak_doy"] - l_met["peak_doy"],
+        }
+
+        for mm, m in enumerate(TRAJ_MONTHS):
+            row[f"early_LST_m{m:02d}"] = float(e_lst[mm])
+            row[f"late_LST_m{m:02d}"] = float(l_lst[mm])
+            row[f"cooling_m{m:02d}"] = float(l_lst[mm] - e_lst[mm])
+
+            row[f"early_EVI_m{m:02d}"] = float(e[f"EVI_m{m:02d}"])
+            row[f"late_EVI_m{m:02d}"] = float(l[f"EVI_m{m:02d}"])
+
+        pair_rows.append(row)
+
+    pairs = pd.DataFrame(pair_rows)
+
+    # Balance
+    matched_early = early.iloc[[s["early_i"] for s in selected]].copy()
+    matched_late = late.iloc[[s["late_j"] for s in selected]].copy()
+
+    before_smd = []
+    after_smd = []
+
+    for c in control_cols:
+        before_smd.append(abs(standardized_mean_difference(early[c], late[c])))
+        after_smd.append(abs(standardized_mean_difference(matched_early[c], matched_late[c])))
+
+    summary = {
+        "sample_city_id": int(pairs["sample_city_id"].iloc[0]),
+        "sample_city_name": str(pairs["sample_city_name"].iloc[0]),
+        "sample_year": int(pairs["sample_year"].iloc[0]),
+
+        "n_pairs": int(len(pairs)),
+        "mean_onset_gap_months": float(pairs["onset_gap_months"].mean()),
+
+        "mean_observed_d_warm_p95": float(pairs["observed_d_warm_p95"].mean()),
+        "median_observed_d_warm_p95": float(pairs["observed_d_warm_p95"].median()),
+        "frac_pairs_p95_cooling": float((pairs["observed_d_warm_p95"] < 0).mean()),
+
+        "mean_observed_d_heat_load": float(pairs["observed_d_heat_load"].mean()),
+        "median_observed_d_heat_load": float(pairs["observed_d_heat_load"].median()),
+        "frac_pairs_heat_load_reduction": float((pairs["observed_d_heat_load"] < 0).mean()),
+
+        "mean_observed_d_peak_time": float(pairs["observed_d_peak_time"].mean()),
+        "median_observed_d_peak_time": float(pairs["observed_d_peak_time"].median()),
+        "frac_pairs_peak_delayed": float((pairs["observed_d_peak_time"] > 0).mean()),
+
+        "mean_control_distance": float(pairs["control_distance"].mean()),
+        "mean_evi_shape_rmse": float(pairs["evi_shape_rmse"].mean()),
+        "before_smd_mean_abs": float(np.nanmean(before_smd)),
+        "after_smd_mean_abs": float(np.nanmean(after_smd)),
+    }
+
+    # Ranking score: prefer similarity + ML-consistent signs
+    # More negative p95/heat_load and more positive peak_time are better.
+    summary["ml_consistency_score"] = (
+        -5.0 * summary["mean_observed_d_warm_p95"]
+        -0.05 * summary["mean_observed_d_heat_load"]
+        +0.05 * summary["mean_observed_d_peak_time"]
+        -0.5 * summary["after_smd_mean_abs"]
+        -0.8 * summary["mean_evi_shape_rmse"]
+    )
+
+    return pairs, summary
+
+# ============================================================
+# 7. Scan city-years and choose representative case
+# ============================================================
+
+all_summaries = []
+all_pair_files = []
+
+for _, r in cy_count.iterrows():
+    city_id = r["sample_city_id"]
+    year = r["sample_year"]
+
+    g = py[(py["sample_city_id"] == city_id) & (py["sample_year"] == year)].copy()
+
+    pairs, summary = match_one_city_year(g)
+
+    if pairs is None:
+        continue
+
+    all_summaries.append(summary)
+
+    fp = os.path.join(
+        OUT_DIR,
+        f"pairs_city{int(city_id)}_{str(summary['sample_city_name']).replace(' ', '_')}_{int(year)}.csv"
+    )
+    pairs.to_csv(fp, index=False)
+    all_pair_files.append(fp)
+
+    print(
+        f"Matched {summary['sample_city_name']} {year}: "
+        f"n={summary['n_pairs']}, "
+        f"dP95={summary['mean_observed_d_warm_p95']:.3f}, "
+        f"dHeat={summary['mean_observed_d_heat_load']:.3f}, "
+        f"dPeak={summary['mean_observed_d_peak_time']:.2f}, "
+        f"score={summary['ml_consistency_score']:.3f}"
+    )
+
+summ_df = pd.DataFrame(all_summaries)
+
+if summ_df.empty:
+    raise ValueError(
+        "No valid city-year matched case found. "
+        "Try increasing MAX_CONTROL_DISTANCE or MAX_EVI_SHAPE_RMSE."
+    )
+
+summ_df = summ_df.sort_values("ml_consistency_score", ascending=False).reset_index(drop=True)
+
+summary_fp = os.path.join(OUT_DIR, "observed_matching_ML_metric_cityyear_summaries.csv")
+summ_df.to_csv(summary_fp, index=False)
+
+print("\n=== Top representative observed matched city-years ===")
+print(summ_df.head(15).to_string(index=False))
+
+best = summ_df.iloc[0]
+best_city_id = int(best["sample_city_id"])
+best_city_name = str(best["sample_city_name"])
+best_year = int(best["sample_year"])
+
+best_pairs_fp = os.path.join(
+    OUT_DIR,
+    f"pairs_city{best_city_id}_{best_city_name.replace(' ', '_')}_{best_year}.csv"
+)
+
+best_pairs = pd.read_csv(best_pairs_fp)
+
+print("\n=== Selected representative city-year ===")
+print(best.to_string())
+
+# ============================================================
+# 8. Monthly trajectory for best city-year
+# ============================================================
+
+traj_rows = []
+
+for m in TRAJ_MONTHS:
+    vals = best_pairs[f"cooling_m{m:02d}"].replace([np.inf, -np.inf], np.nan).dropna()
+
+    traj_rows.append({
+        "month": int(m),
+        "mean_cooling": float(vals.mean()),
+        "median_cooling": float(vals.median()),
+        "q25": float(vals.quantile(0.25)),
+        "q75": float(vals.quantile(0.75)),
+        "se": float(vals.std() / np.sqrt(len(vals))) if len(vals) > 1 else np.nan,
+        "frac_positive": float((vals > 0).mean()),
+        "n": int(len(vals)),
+    })
+
+traj = pd.DataFrame(traj_rows)
+traj_fp = os.path.join(OUT_DIR, "selected_cityyear_monthly_LST_trajectory_cooling.csv")
+traj.to_csv(traj_fp, index=False)
+
+print("\n=== Selected city-year monthly cooling trajectory ===")
+print(traj.to_string(index=False))
+
+# Mean trajectories
+months = np.array(TRAJ_MONTHS)
+
+early_evi = np.array([best_pairs[f"early_EVI_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+late_evi = np.array([best_pairs[f"late_EVI_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+
+early_lst = np.array([best_pairs[f"early_LST_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+late_lst = np.array([best_pairs[f"late_LST_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+cooling = late_lst - early_lst
+
+# ============================================================
+# 9. Plot representative observed matching
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 140,
+    "savefig.dpi": 300,
+})
+
+fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.8))
+axes = axes.ravel()
+
+# a EVI
+ax = axes[0]
+ax.plot(months, early_evi, marker="o", linewidth=2.3, label="Earlier EVI trajectory")
+ax.plot(months, late_evi, marker="s", linewidth=2.0, label="Later EVI trajectory")
+ax.set_xlabel("Month")
+ax.set_ylabel("EVI")
+ax.set_title(f"a  Matched EVI trajectories\n{best_city_name}, {best_year}", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+ax.legend(frameon=False)
+
+# b LST
+ax = axes[1]
+ax.plot(months, early_lst, marker="o", linewidth=2.3, label="Earlier EVI")
+ax.plot(months, late_lst, marker="s", linewidth=2.0, label="Later EVI")
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+ax.set_xlabel("Month")
+ax.set_ylabel("LST anomaly (°C)")
+ax.set_title("b  Matched LST anomaly trajectories", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+ax.legend(frameon=False)
+
+# c cooling trajectory
+ax = axes[2]
+ax.plot(traj["month"], traj["mean_cooling"], marker="o", linewidth=2.3, color="#365C6A")
+ax.fill_between(
+    traj["month"],
+    traj["mean_cooling"] - 1.96 * traj["se"],
+    traj["mean_cooling"] + 1.96 * traj["se"],
+    color="#365C6A",
+    alpha=0.15
+)
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+ax.set_xlabel("Month")
+ax.set_ylabel("Cooling: later − earlier LST anomaly (°C)")
+ax.set_title("c  Observed LST trajectory difference", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+
+# d metric comparison
+metric_names = ["P95 LST", "Heat load", "Peak timing"]
+metric_vals = [
+    best["mean_observed_d_warm_p95"],
+    best["mean_observed_d_heat_load"],
+    best["mean_observed_d_peak_time"],
+]
+
+ax = axes[3]
+bars = ax.bar(metric_names, metric_vals, alpha=0.85)
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+ax.set_ylabel("Early − late")
+ax.set_title("d  ML-aligned observed metrics", loc="left", fontweight="bold")
+ax.grid(axis="y", linestyle=":", alpha=0.3)
+
+for i, v in enumerate(metric_vals):
+    ax.text(i, v, f"{v:.2f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+
+plt.tight_layout()
+
+fig_png = os.path.join(OUT_DIR, "FigS_selected_observed_matching_ML_metrics.png")
+fig_pdf = os.path.join(OUT_DIR, "FigS_selected_observed_matching_ML_metrics.pdf")
+fig.savefig(fig_png, dpi=300, bbox_inches="tight")
+fig.savefig(fig_pdf, bbox_inches="tight")
+plt.show()
+
+print("Saved figure:")
+print(fig_png)
+print(fig_pdf)
+
+# ============================================================
+# 10. Write report
+# ============================================================
+
+settings = {
+    "DATA_PATH": DATA_PATH,
+    "EARLY_Q": EARLY_Q,
+    "LATE_Q": LATE_Q,
+    "TRAJ_MONTHS": TRAJ_MONTHS,
+    "WARM_MONTHS": WARM_MONTHS,
+    "PRE_MONTHS": PRE_MONTHS,
+    "CLIM_MONTHS": CLIM_MONTHS,
+    "MAX_PIXEL_YEARS_PER_CITY_YEAR": MAX_PIXEL_YEARS_PER_CITY_YEAR,
+    "MAX_CITY_YEARS_TO_SCAN": MAX_CITY_YEARS_TO_SCAN,
+    "MAX_CONTROL_DISTANCE": MAX_CONTROL_DISTANCE,
+    "USE_SHAPE_FILTER": USE_SHAPE_FILTER,
+    "MAX_EVI_SHAPE_RMSE": MAX_EVI_SHAPE_RMSE,
+    "MIN_MATCHED_PAIRS": MIN_MATCHED_PAIRS,
+    "control_cols": control_cols,
+}
+
+report_path = os.path.join(OUT_DIR, "observed_matching_ML_metrics_report.txt")
+
+with open(report_path, "w") as f:
+    f.write("Observed matching analogue of ML timing-shift metrics\n")
+    f.write("====================================================\n\n")
+
+    f.write("Purpose:\n")
+    f.write(
+        "This analysis selects representative city-years in which earlier and later EVI trajectories "
+        "are matched under similar static background, climate trajectory, EVI amount, and pre-LST state. "
+        "It evaluates the same metrics used in the ML timing-shift simulation: warm-season P95 LST, "
+        "heat load, and peak timing.\n\n"
+    )
+
+    f.write("Sign convention:\n")
+    f.write(
+        "observed_d_warm_p95 = early_P95 - late_P95; negative values indicate cooling.\n"
+        "observed_d_heat_load = early_heat_load - late_heat_load; negative values indicate reduced heat load.\n"
+        "observed_d_peak_time = early_peak_time - late_peak_time; positive values indicate delayed peak timing.\n\n"
+    )
+
+    f.write("Settings:\n")
+    f.write(json.dumps(settings, indent=2))
+    f.write("\n\n")
+
+    f.write("Top city-year summaries:\n")
+    f.write(summ_df.head(20).to_string(index=False))
+    f.write("\n\n")
+
+    f.write("Selected representative city-year:\n")
+    f.write(best.to_string())
+    f.write("\n\n")
+
+    f.write("Monthly cooling trajectory:\n")
+    f.write(traj.to_string(index=False))
+    f.write("\n\n")
+
+print("Saved report:")
+print(report_path)
+
+print("\n============================================================")
+print("MANUSCRIPT-READY NUMERIC FACTS")
+print("============================================================")
+print("Selected representative city-year:")
+print(best.to_string())
+print("\nMonthly trajectory:")
+print(traj.to_string(index=False))
+print("\nTop 10 city-years:")
+print(summ_df.head(10).to_string(index=False))
+print("\nOutputs saved to:")
+print(OUT_DIR)
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Observed marginal cooling capacity from fast matched benchmark
+#
+# Purpose:
+#   Convert observed matched cooling benefit curves into
+#   marginal cooling capacity curves.
+#
+# Definition:
+#   Cooling benefit:
+#       CB(EVI_k) = LST'_low-ref - LST'_target-bin
+#
+#   Marginal cooling capacity:
+#       MCC(EVI_k) = [CB(EVI_k) - CB(EVI_{k-1})] / [EVI_k - EVI_{k-1}]
+#
+# Unit:
+#   °C per unit EVI
+#
+# Interpretation:
+#   Positive MCC means increasing EVI from the previous bin to the current bin
+#   provides additional cooling.
+#
+#   Declining MCC means additional EVI still may cool, but the extra cooling
+#   per unit EVI becomes weaker.
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Paths
+# ============================================================
+
+IN_DIR = "/content/drive/MyDrive/anature_revised/section6_7_fast_matched_observed_benchmark"
+
+RESPONSE_FP = os.path.join(IN_DIR, "fast_matched_observed_response_curves.csv")
+DIAG_FP = os.path.join(IN_DIR, "fast_matched_observed_coverage_diagnostics.csv")
+
+OUT_DIR = os.path.join(IN_DIR, "marginal_cooling_capacity_EVI")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# Main feature
+FEATURE = "EVI.EVI"
+
+# Smoothing window for marginal curve
+SMOOTH_WIN = 3
+
+# Threshold for transition range:
+# first point after the peak where marginal capacity drops below this fraction of max
+DROP_FRAC = 0.25
+
+# ============================================================
+# 1. Load matched observed response curves
+# ============================================================
+
+response_df = pd.read_csv(RESPONSE_FP)
+
+if os.path.exists(DIAG_FP):
+    diag_df = pd.read_csv(DIAG_FP)
+else:
+    diag_df = pd.DataFrame()
+
+print("Loaded response_df:", response_df.shape)
+print(response_df.head())
+
+response_df = response_df[response_df["feature"] == FEATURE].copy()
+
+if response_df.empty:
+    raise ValueError(f"No rows found for {FEATURE}")
+
+# ============================================================
+# 2. Compute marginal cooling capacity
+# ============================================================
+
+def compute_marginal_capacity(df, feature=FEATURE, smooth_win=3):
+    """
+    For each group_type/group curve:
+        x = EVI bin mean
+        y = matched cooling benefit
+        marginal capacity = dy / dx
+    """
+    rows = []
+
+    for (gtype, group), sub in df.groupby(["group_type", "group"]):
+        sub = sub.sort_values("x_target_mean").reset_index(drop=True).copy()
+
+        if len(sub) < 3:
+            continue
+
+        x = sub["x_target_mean"].values.astype(float)
+        y = sub["mean_cooling_benefit"].values.astype(float)
+
+        dx = np.diff(x)
+        dy = np.diff(y)
+
+        mcc = np.full_like(dy, np.nan, dtype=float)
+        valid = np.isfinite(dx) & np.isfinite(dy) & (dx != 0)
+        mcc[valid] = dy[valid] / dx[valid]
+
+        # assign marginal value to segment midpoint
+        x_mid = (x[:-1] + x[1:]) / 2.0
+        cb_left = y[:-1]
+        cb_right = y[1:]
+
+        # smooth for interpretation only
+        mcc_smooth = (
+            pd.Series(mcc)
+            .rolling(smooth_win, center=True, min_periods=1)
+            .mean()
+            .values
+        )
+
+        for i in range(len(mcc)):
+            rows.append({
+                "feature": feature,
+                "group_type": gtype,
+                "group": group,
+                "segment_id": i,
+                "x_left": float(x[i]),
+                "x_right": float(x[i + 1]),
+                "x_mid": float(x_mid[i]),
+                "cooling_benefit_left": float(cb_left[i]),
+                "cooling_benefit_right": float(cb_right[i]),
+                "delta_cooling_benefit": float(dy[i]),
+                "delta_EVI": float(dx[i]),
+                "marginal_cooling_capacity": float(mcc[i]),
+                "marginal_cooling_capacity_smooth": float(mcc_smooth[i]),
+            })
+
+    return pd.DataFrame(rows)
+
+
+mcc_df = compute_marginal_capacity(response_df, feature=FEATURE, smooth_win=SMOOTH_WIN)
+
+MCC_FP = os.path.join(OUT_DIR, "observed_EVI_marginal_cooling_capacity.csv")
+mcc_df.to_csv(MCC_FP, index=False)
+
+print("\nSaved marginal capacity table:")
+print(MCC_FP)
+
+print("\nMarginal capacity preview:")
+print(mcc_df.head().to_string(index=False))
+
+# ============================================================
+# 3. Summarize transition range and marginal weakening
+# ============================================================
+
+def summarize_marginal_capacity(mcc_df, response_df, drop_frac=0.25):
+    rows = []
+
+    for (gtype, group), sub in mcc_df.groupby(["group_type", "group"]):
+        sub = sub.sort_values("x_mid").reset_index(drop=True)
+
+        curve = response_df[
+            (response_df["group_type"] == gtype) &
+            (response_df["group"] == group)
+        ].sort_values("x_target_mean").reset_index(drop=True)
+
+        if sub.empty or curve.empty:
+            continue
+
+        s = sub["marginal_cooling_capacity_smooth"].values.astype(float)
+        x = sub["x_mid"].values.astype(float)
+
+        positive = s[np.isfinite(s) & (s > 0)]
+
+        if len(positive) > 0:
+            max_mcc = float(np.nanmax(positive))
+            idx_peak = int(np.nanargmax(s))
+            x_peak = float(x[idx_peak])
+            drop_threshold = drop_frac * max_mcc
+
+            x_drop = np.nan
+            for j in range(idx_peak + 1, len(s)):
+                if np.isfinite(s[j]) and s[j] <= drop_threshold:
+                    x_drop = float(x[j])
+                    break
+        else:
+            max_mcc = np.nan
+            x_peak = np.nan
+            drop_threshold = np.nan
+            x_drop = np.nan
+
+        # cumulative cooling benefit info
+        max_cb = float(curve["mean_cooling_benefit"].max())
+        x_at_max_cb = float(curve.loc[curve["mean_cooling_benefit"].idxmax(), "x_target_mean"])
+        final_cb = float(curve["mean_cooling_benefit"].iloc[-1])
+        final_x = float(curve["x_target_mean"].iloc[-1])
+
+        # average marginal capacity over early / mid / high EVI ranges
+        early = sub[sub["x_mid"] <= sub["x_mid"].quantile(1/3)]
+        mid = sub[
+            (sub["x_mid"] > sub["x_mid"].quantile(1/3)) &
+            (sub["x_mid"] <= sub["x_mid"].quantile(2/3))
+        ]
+        high = sub[sub["x_mid"] > sub["x_mid"].quantile(2/3)]
+
+        rows.append({
+            "feature": FEATURE,
+            "group_type": gtype,
+            "group": group,
+            "n_segments": int(len(sub)),
+
+            "max_cooling_benefit": max_cb,
+            "x_at_max_cooling_benefit": x_at_max_cb,
+            "final_cooling_benefit": final_cb,
+            "final_x": final_x,
+
+            "max_marginal_cooling_capacity": max_mcc,
+            "x_at_max_marginal_capacity": x_peak,
+            "drop_threshold_fraction": drop_frac,
+            "drop_threshold_value": drop_threshold,
+            "x_marginal_capacity_drop": x_drop,
+
+            "mean_MCC_early_EVI": float(early["marginal_cooling_capacity_smooth"].mean()),
+            "mean_MCC_mid_EVI": float(mid["marginal_cooling_capacity_smooth"].mean()),
+            "mean_MCC_high_EVI": float(high["marginal_cooling_capacity_smooth"].mean()),
+
+            "frac_positive_MCC": float((sub["marginal_cooling_capacity"] > 0).mean()),
+            "frac_positive_MCC_smooth": float((sub["marginal_cooling_capacity_smooth"] > 0).mean()),
+        })
+
+    return pd.DataFrame(rows)
+
+
+summary_df = summarize_marginal_capacity(
+    mcc_df=mcc_df,
+    response_df=response_df,
+    drop_frac=DROP_FRAC
+)
+
+SUMMARY_FP = os.path.join(OUT_DIR, "observed_EVI_marginal_cooling_capacity_summary.csv")
+summary_df.to_csv(SUMMARY_FP, index=False)
+
+print("\n=== Observed EVI marginal cooling capacity summary ===")
+print(summary_df.to_string(index=False))
+print("\nSaved summary:")
+print(SUMMARY_FP)
+
+# ============================================================
+# 4. Plot: unified y-axis = marginal cooling capacity
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 140,
+    "savefig.dpi": 300,
+})
+
+colors = {
+    "All": "#1F2937",
+    "Low": "#4C78A8",
+    "Mid": "#7A7A7A",
+    "High": "#B85C38",
+}
+
+# ------------------------------------------------------------
+# Figure 1: All + VPD + SSRD marginal cooling capacity
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8), sharey=True)
+
+# Panel a: all
+ax = axes[0]
+sub = mcc_df[
+    (mcc_df["group_type"] == "All") &
+    (mcc_df["group"] == "All")
+].sort_values("x_mid")
+
+ax.plot(
+    sub["x_mid"],
+    sub["marginal_cooling_capacity_smooth"],
+    marker="o",
+    linewidth=2.3,
+    markersize=4,
+    color=colors["All"],
+    label="All"
+)
+
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.1)
+ax.set_title("a  All backgrounds", loc="left", fontweight="bold")
+ax.set_xlabel("EVI")
+ax.set_ylabel("Marginal cooling capacity\n(°C per unit EVI)")
+ax.grid(True, linestyle=":", alpha=0.3)
+
+# Panel b: VPD regimes
+ax = axes[1]
+for reg in ["Low", "Mid", "High"]:
+    sub = mcc_df[
+        (mcc_df["group_type"] == "VPD") &
+        (mcc_df["group"] == reg)
+    ].sort_values("x_mid")
+
+    if sub.empty:
+        continue
+
+    ax.plot(
+        sub["x_mid"],
+        sub["marginal_cooling_capacity_smooth"],
+        marker="o",
+        linewidth=2.0,
+        markersize=3.5,
+        color=colors[reg],
+        label=reg
+    )
+
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.1)
+ax.set_title("b  By VPD background", loc="left", fontweight="bold")
+ax.set_xlabel("EVI")
+ax.grid(True, linestyle=":", alpha=0.3)
+ax.legend(frameon=False, title="VPD")
+
+# Panel c: SSRD regimes
+ax = axes[2]
+for reg in ["Low", "Mid", "High"]:
+    sub = mcc_df[
+        (mcc_df["group_type"] == "SSRD") &
+        (mcc_df["group"] == reg)
+    ].sort_values("x_mid")
+
+    if sub.empty:
+        continue
+
+    ax.plot(
+        sub["x_mid"],
+        sub["marginal_cooling_capacity_smooth"],
+        marker="o",
+        linewidth=2.0,
+        markersize=3.5,
+        color=colors[reg],
+        label=reg
+    )
+
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.1)
+ax.set_title("c  By solar-radiation background", loc="left", fontweight="bold")
+ax.set_xlabel("EVI")
+ax.grid(True, linestyle=":", alpha=0.3)
+ax.legend(frameon=False, title="SSRD")
+
+plt.tight_layout()
+
+FIG1_PNG = os.path.join(OUT_DIR, "FigS_observed_EVI_marginal_cooling_capacity.png")
+FIG1_PDF = os.path.join(OUT_DIR, "FigS_observed_EVI_marginal_cooling_capacity.pdf")
+fig.savefig(FIG1_PNG, dpi=300, bbox_inches="tight")
+fig.savefig(FIG1_PDF, bbox_inches="tight")
+plt.show()
+
+print("Saved:")
+print(FIG1_PNG)
+print(FIG1_PDF)
+
+# ============================================================
+# 5. Plot: cumulative benefit + marginal capacity together
+#    This is optional, but useful for explaining the difference.
+# ============================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
+
+# cumulative benefit
+ax = axes[0]
+sub_cb = response_df[
+    (response_df["group_type"] == "All") &
+    (response_df["group"] == "All")
+].sort_values("x_target_mean")
+
+ax.plot(
+    sub_cb["x_target_mean"],
+    sub_cb["mean_cooling_benefit"],
+    marker="o",
+    linewidth=2.3,
+    markersize=4,
+    color="#1F2937"
+)
+
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.1)
+ax.set_xlabel("EVI")
+ax.set_ylabel("Cumulative cooling benefit\nrelative to low-EVI reference (°C)")
+ax.set_title("a  Cumulative cooling benefit", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+
+# marginal capacity
+ax = axes[1]
+sub_mcc = mcc_df[
+    (mcc_df["group_type"] == "All") &
+    (mcc_df["group"] == "All")
+].sort_values("x_mid")
+
+ax.plot(
+    sub_mcc["x_mid"],
+    sub_mcc["marginal_cooling_capacity_smooth"],
+    marker="o",
+    linewidth=2.3,
+    markersize=4,
+    color="#365C6A"
+)
+
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.1)
+ax.set_xlabel("EVI")
+ax.set_ylabel("Marginal cooling capacity\n(°C per unit EVI)")
+ax.set_title("b  Additional cooling per EVI increase", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+
+plt.tight_layout()
+
+FIG2_PNG = os.path.join(OUT_DIR, "FigS_observed_EVI_cumulative_vs_marginal.png")
+FIG2_PDF = os.path.join(OUT_DIR, "FigS_observed_EVI_cumulative_vs_marginal.pdf")
+fig.savefig(FIG2_PNG, dpi=300, bbox_inches="tight")
+fig.savefig(FIG2_PDF, bbox_inches="tight")
+plt.show()
+
+print("Saved:")
+print(FIG2_PNG)
+print(FIG2_PDF)
+
+# ============================================================
+# 6. Write numeric report
+# ============================================================
+
+REPORT_FP = os.path.join(OUT_DIR, "observed_EVI_marginal_cooling_capacity_report.txt")
+
+with open(REPORT_FP, "w") as f:
+    f.write("Observed EVI marginal cooling capacity\n")
+    f.write("=====================================\n\n")
+
+    f.write("Definition:\n")
+    f.write(
+        "Cooling benefit is defined as the LST anomaly of a matched low-EVI reference "
+        "minus the LST anomaly of a target EVI bin. Marginal cooling capacity is the "
+        "adjacent-bin change in cooling benefit divided by the corresponding change in EVI.\n\n"
+    )
+
+    f.write("Units:\n")
+    f.write("Marginal cooling capacity is expressed as °C per unit EVI.\n\n")
+
+    f.write("Interpretation:\n")
+    f.write(
+        "Positive values mean that increasing EVI from the previous bin to the current bin "
+        "provides additional cooling. A decline in marginal cooling capacity indicates "
+        "weakening additional cooling gain, even if cumulative cooling benefit continues to increase.\n\n"
+    )
+
+    f.write("Summary table:\n")
+    f.write(summary_df.to_string(index=False))
+    f.write("\n\n")
+
+print("Saved report:")
+print(REPORT_FP)
+
+print("\n============================================================")
+print("MANUSCRIPT-READY NUMERIC FACTS")
+print("============================================================")
+print(summary_df.to_string(index=False))
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Observed trajectory matching analogue of ML timing-shift metrics
+#
+# Goal:
+#   Find a representative city-year where early-EVI and late-EVI trajectories
+#   have similar climate/static/EVI-amount/pre-LST backgrounds,
+#   then compare the same metrics used in ML counterfactual simulation:
+#
+#   1) warm-season P95 LST anomaly
+#   2) cumulative heat load
+#   3) peak timing
+#
+# Sign convention, aligned with ML simulation:
+#   observed_d_warm_p95  = early_P95 - late_P95
+#   observed_d_heat_load = early_heat_load - late_heat_load
+#   observed_d_peak_time = early_peak_time - late_peak_time
+#
+# Interpretation:
+#   d_warm_p95 < 0   => early EVI is cooler for P95
+#   d_heat_load < 0  => early EVI has lower heat load
+#   d_peak_time > 0  => early EVI delays LST peak
+#
+# This is an observed matched analogue, not causal proof.
+# ============================================================
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0. Paths and settings
+# ============================================================
+
+DATA_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+OUT_DIR = "/content/drive/MyDrive/anature_revised/section6_10_observed_matching_ML_metrics"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+rng = np.random.default_rng(RANDOM_SEED)
+
+TIMING_FEATURE = "EVI.EVI"
+
+# Months
+TRAJ_MONTHS = [3, 4, 5, 6, 7, 8, 9]
+WARM_MONTHS = [6, 7, 8]
+PRE_MONTHS  = [3, 4, 5]
+CLIM_MONTHS = [3, 4, 5, 6, 7, 8, 9]
+
+MONTH_TO_DOY = {
+    1: 15, 2: 45, 3: 75, 4: 105, 5: 135, 6: 165,
+    7: 195, 8: 225, 9: 255, 10: 285, 11: 315, 12: 345
+}
+
+# Early / late definition
+EARLY_Q = 0.30
+LATE_Q  = 0.70
+
+# Speed controls
+MAX_PIXEL_YEARS_PER_CITY_YEAR = 700
+MAX_CITY_YEARS_TO_SCAN = 300
+MIN_PIXEL_YEARS_CITY_YEAR = 120
+
+MAX_EARLY_PER_CITY_YEAR = 100
+MAX_LATE_PER_CITY_YEAR = 250
+
+# Matching controls
+K_CANDIDATES = 20
+MAX_CONTROL_DISTANCE = 7.5
+
+# Shape filtering
+USE_SHAPE_FILTER = True
+MAX_EVI_SHAPE_RMSE = 0.12
+MIN_SHAPE_OVERLAP = 5
+
+# Minimum successful pairs per city-year
+MIN_MATCHED_PAIRS = 25
+
+# For heat load; monthly approximation
+MONTH_DAYS = 30.0
+
+CONTROL_PATTERNS = {
+    "DEM":  ["DEM"],
+    "LC":   ["LC"],
+    "NTL":  ["NTL"],
+    "VPD":  ["VPD"],
+    "SSRD": ["SSRD", "SWDOWN", "SHORTWAVE"],
+    "TP":   ["TP", "PRECIP", "PRCP"],
+}
+
+# ============================================================
+# 1. Load data
+# ============================================================
+
+npz = np.load(DATA_PATH, allow_pickle=True)
+
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+meta_keys = [
+    "sample_city_id", "sample_city_name", "sample_year",
+    "sample_month", "sample_row", "sample_col"
+]
+
+meta = {}
+for k in meta_keys:
+    if k in npz.files:
+        meta[k] = npz[k]
+
+for k in ["sample_city_id", "sample_year", "sample_month", "sample_row", "sample_col"]:
+    if k not in meta:
+        raise ValueError(f"Missing required metadata: {k}")
+
+mask = np.isfinite(y_raw)
+X_raw = X_raw[mask]
+y = y_raw[mask]
+
+for k in list(meta.keys()):
+    meta[k] = meta[k][mask]
+
+df = pd.DataFrame(X_raw, columns=channels_raw)
+df["LST_obs"] = y
+
+df["sample_city_id"] = meta["sample_city_id"].astype(np.int32)
+df["sample_year"] = meta["sample_year"].astype(np.int16)
+df["sample_month"] = meta["sample_month"].astype(np.int8)
+df["sample_row"] = meta["sample_row"].astype(np.int32)
+df["sample_col"] = meta["sample_col"].astype(np.int32)
+
+if "sample_city_name" in meta:
+    df["sample_city_name"] = meta["sample_city_name"].astype(str)
+else:
+    df["sample_city_name"] = df["sample_city_id"].astype(str)
+
+print("Loaded df:", df.shape)
+print("Channels:", channels_raw)
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+def find_col_by_patterns(columns, patterns):
+    for pat in patterns:
+        for c in columns:
+            if pat.lower() in str(c).lower():
+                return c
+    return None
+
+def get_colmap(df_in):
+    return {k: find_col_by_patterns(df_in.columns, v) for k, v in CONTROL_PATTERNS.items()}
+
+def interpolate_rows(mat):
+    tmp = pd.DataFrame(mat).interpolate(axis=1, limit_direction="both").values.astype(float)
+    row_mean = np.nanmean(tmp, axis=1)
+    bad = ~np.isfinite(tmp)
+    if bad.any():
+        inds = np.where(bad)
+        tmp[inds] = np.take(row_mean, inds[0])
+    return tmp
+
+def rowwise_onset(evi_wide):
+    mat0 = evi_wide.values.astype(float)
+    valid_count = np.isfinite(mat0).sum(axis=1)
+
+    mat = interpolate_rows(mat0)
+
+    left = np.concatenate([mat[:, [0]], mat[:, :-1]], axis=1)
+    right = np.concatenate([mat[:, 1:], mat[:, [-1]]], axis=1)
+    sm = (left + mat + right) / 3.0
+
+    diff = np.diff(sm, axis=1)
+    maxdiff = np.nanmax(diff, axis=1)
+    idx = np.nanargmax(diff, axis=1)
+
+    onset = idx + 2
+    onset = onset.astype(float)
+    onset[(valid_count < 6) | (maxdiff <= 0)] = np.nan
+
+    return onset
+
+def shift_late_curve_earlier(late_curve, onset_gap):
+    """
+    Shift late EVI curve earlier by onset_gap months.
+    """
+    d = int(round(onset_gap))
+    shifted = np.full_like(late_curve, np.nan, dtype=float)
+
+    if d <= 0:
+        return late_curve.copy()
+
+    if d >= len(late_curve):
+        return shifted
+
+    shifted[:-d] = late_curve[d:]
+    return shifted
+
+def evi_shape_rmse_after_shift(early_curve, late_curve, onset_gap):
+    shifted = shift_late_curve_earlier(late_curve, onset_gap)
+    ok = np.isfinite(early_curve) & np.isfinite(shifted)
+
+    if ok.sum() < MIN_SHAPE_OVERLAP:
+        return np.nan
+
+    return float(np.sqrt(np.mean((early_curve[ok] - shifted[ok]) ** 2)))
+
+def robust_peak_time_month(values, months):
+    """
+    Robust peak time as mean month of top-2 LST anomaly values.
+    """
+    values = np.asarray(values, dtype=float)
+    months = np.asarray(months, dtype=float)
+
+    ok = np.isfinite(values)
+    values = values[ok]
+    months = months[ok]
+
+    if len(values) == 0:
+        return np.nan
+
+    k = min(2, len(values))
+    idx = np.argsort(values)[-k:]
+    peak_month = float(np.mean(months[idx]))
+    return peak_month
+
+def compute_observed_metrics(lst_month_values, warm_idx, all_months):
+    """
+    Compute metrics analogous to ML simulation, but on monthly observed LST anomaly.
+    """
+    x = np.asarray(lst_month_values, dtype=float)
+    months = np.asarray(all_months, dtype=int)
+
+    warm_x = x[warm_idx]
+
+    warm_p95 = float(np.nanpercentile(warm_x, 95))
+
+    # Heat load relative to 0 LST anomaly:
+    # positive LST anomaly months contribute to heat load.
+    heat_load = float(np.nansum(np.maximum(warm_x, 0)) * MONTH_DAYS)
+
+    peak_month = robust_peak_time_month(x, months)
+    peak_doy = float(MONTH_TO_DOY.get(int(round(peak_month)), np.nan)) if np.isfinite(peak_month) else np.nan
+
+    return {
+        "warm_p95": warm_p95,
+        "heat_load": heat_load,
+        "peak_month": peak_month,
+        "peak_doy": peak_doy,
+    }
+
+def standardized_mean_difference(a, b):
+    a = pd.to_numeric(pd.Series(a), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    b = pd.to_numeric(pd.Series(b), errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+
+    if len(a) < 2 or len(b) < 2:
+        return np.nan
+
+    sd = np.sqrt((np.var(a, ddof=1) + np.var(b, ddof=1)) / 2)
+    if sd == 0 or not np.isfinite(sd):
+        return np.nan
+
+    return float((np.mean(a) - np.mean(b)) / sd)
+
+# ============================================================
+# 3. Build monthly wide pixel-year table
+# ============================================================
+
+colmap = get_colmap(df)
+print("Detected columns:", colmap)
+
+if TIMING_FEATURE not in df.columns:
+    raise ValueError(f"Missing timing feature: {TIMING_FEATURE}")
+
+df[TIMING_FEATURE] = pd.to_numeric(df[TIMING_FEATURE], errors="coerce").clip(0, 1)
+
+if "LAI.LAI" in df.columns:
+    df["LAI.LAI"] = pd.to_numeric(df["LAI.LAI"], errors="coerce").clip(0, 8)
+
+# LST anomaly within city-year-month
+df["LST_anom_cym"] = (
+    df["LST_obs"] -
+    df.groupby(["sample_city_id", "sample_year", "sample_month"])["LST_obs"].transform("mean")
+)
+
+df["pixel_key"] = (
+    df["sample_city_id"].astype(str) + "_" +
+    df["sample_row"].astype(str) + "_" +
+    df["sample_col"].astype(str)
+)
+
+idx_cols = ["sample_city_id", "sample_city_name", "sample_year", "sample_row", "sample_col", "pixel_key"]
+
+need_cols = idx_cols + ["sample_month", "LST_anom_cym", TIMING_FEATURE]
+
+if "LAI.LAI" in df.columns:
+    need_cols.append("LAI.LAI")
+
+for key, c in colmap.items():
+    if c is not None and c in df.columns:
+        need_cols.append(c)
+
+need_cols = list(dict.fromkeys(need_cols))
+
+monthly = (
+    df[need_cols]
+    .groupby(idx_cols + ["sample_month"], sort=False)
+    .median(numeric_only=True)
+    .reset_index()
+)
+
+print("Monthly table:", monthly.shape)
+
+def make_wide(value_col, aggfunc="mean"):
+    w = monthly.pivot_table(
+        index=idx_cols,
+        columns="sample_month",
+        values=value_col,
+        aggfunc=aggfunc
+    )
+    for m in range(1, 13):
+        if m not in w.columns:
+            w[m] = np.nan
+    return w[range(1, 13)]
+
+evi_wide = make_wide(TIMING_FEATURE, "median")
+lst_wide = make_wide("LST_anom_cym", "mean")
+
+py = evi_wide.reset_index()[idx_cols].copy()
+py["t_EVI_onset_month"] = rowwise_onset(evi_wide)
+
+# EVI trajectory metrics
+py["annual_EVI_mean"] = evi_wide.mean(axis=1).values
+py["annual_EVI_max"] = evi_wide.max(axis=1).values
+py["annual_EVI_min"] = evi_wide.min(axis=1).values
+py["annual_EVI_amp"] = py["annual_EVI_max"] - py["annual_EVI_min"]
+py["spring_EVI_mean"] = evi_wide[PRE_MONTHS].mean(axis=1).values
+py["warm_EVI_mean"] = evi_wide[WARM_MONTHS].mean(axis=1).values
+
+# LST trajectory
+for m in TRAJ_MONTHS:
+    py[f"LST_m{m:02d}"] = lst_wide[m].values
+    py[f"EVI_m{m:02d}"] = evi_wide[m].values
+
+for m in range(1, 13):
+    py[f"EVI_full_m{m:02d}"] = evi_wide[m].values
+
+py["pre_LST_mean"] = lst_wide[PRE_MONTHS].mean(axis=1).values
+py["warm_LST_mean"] = lst_wide[WARM_MONTHS].mean(axis=1).values
+
+# Static controls
+static_cols = []
+for key in ["DEM", "LC", "NTL"]:
+    c = colmap.get(key)
+    if c is not None and c in monthly.columns:
+        static_cols.append(c)
+
+if static_cols:
+    stat = monthly.groupby(idx_cols, sort=False)[static_cols].median().reset_index()
+    py = py.merge(stat, on=idx_cols, how="left")
+
+# Climate monthly trajectory controls
+clim_cols = []
+for key in ["VPD", "SSRD", "TP"]:
+    c = colmap.get(key)
+    if c is not None and c in monthly.columns:
+        clim_cols.append(c)
+
+for c in clim_cols:
+    w = make_wide(c, "mean")
+
+    for m in CLIM_MONTHS:
+        py[f"{c}_m{m:02d}"] = w[m].values
+
+    py[f"spring_{c}"] = w[PRE_MONTHS].mean(axis=1).values
+    py[f"warm_{c}"] = w[WARM_MONTHS].mean(axis=1).values
+    py[f"traj_{c}_mean"] = w[TRAJ_MONTHS].mean(axis=1).values
+    py[f"traj_{c}_amp"] = (w[TRAJ_MONTHS].max(axis=1) - w[TRAJ_MONTHS].min(axis=1)).values
+
+# LAI optional amount metrics
+if "LAI.LAI" in monthly.columns:
+    lai_wide = make_wide("LAI.LAI", "median")
+    py["annual_LAI_mean"] = lai_wide.mean(axis=1).values
+    py["annual_LAI_max"] = lai_wide.max(axis=1).values
+    py["annual_LAI_amp"] = (lai_wide.max(axis=1) - lai_wide.min(axis=1)).values
+    py["warm_LAI_mean"] = lai_wide[WARM_MONTHS].mean(axis=1).values
+
+# Valid rows
+py = py.replace([np.inf, -np.inf], np.nan)
+py = py.dropna(subset=["t_EVI_onset_month", "warm_LST_mean", "pre_LST_mean"])
+
+print("Pixel-year table before cap:", py.shape)
+
+# Cap per city-year for speed
+parts = []
+for _, g in py.groupby(["sample_city_id", "sample_year"], sort=False):
+    if len(g) > MAX_PIXEL_YEARS_PER_CITY_YEAR:
+        parts.append(g.sample(n=MAX_PIXEL_YEARS_PER_CITY_YEAR, random_state=RANDOM_SEED))
+    else:
+        parts.append(g)
+
+py = pd.concat(parts, ignore_index=True)
+print("Pixel-year table after cap:", py.shape)
+
+py.to_csv(os.path.join(OUT_DIR, "pixel_year_trajectory_table.csv"), index=False)
+
+# ============================================================
+# 4. Controls for matching
+# ============================================================
+
+control_cols = []
+
+# static
+for c in static_cols:
+    if c in py.columns:
+        control_cols.append(c)
+
+# monthly climate trajectory
+for c in clim_cols:
+    for m in CLIM_MONTHS:
+        cc = f"{c}_m{m:02d}"
+        if cc in py.columns:
+            control_cols.append(cc)
+
+# pre-LST state
+control_cols.append("pre_LST_mean")
+
+# EVI amount, not full timing
+for c in ["annual_EVI_mean", "annual_EVI_max", "annual_EVI_amp", "warm_EVI_mean"]:
+    if c in py.columns:
+        control_cols.append(c)
+
+# optional LAI amount
+for c in ["annual_LAI_mean", "annual_LAI_max", "annual_LAI_amp", "warm_LAI_mean"]:
+    if c in py.columns:
+        control_cols.append(c)
+
+control_cols = list(dict.fromkeys(control_cols))
+
+control_cols = [
+    c for c in control_cols
+    if c in py.columns and np.isfinite(pd.to_numeric(py[c], errors="coerce")).mean() > 0.60
+]
+
+print("Matching controls:")
+print(control_cols)
+
+if len(control_cols) < 8:
+    raise ValueError("Too few matching controls.")
+
+# ============================================================
+# 5. Candidate city-years
+# ============================================================
+
+cy_count = (
+    py
+    .groupby(["sample_city_id", "sample_city_name", "sample_year"])
+    .size()
+    .reset_index(name="n")
+    .sort_values("n", ascending=False)
+)
+
+cy_count = cy_count[cy_count["n"] >= MIN_PIXEL_YEARS_CITY_YEAR].copy()
+
+if len(cy_count) > MAX_CITY_YEARS_TO_SCAN:
+    cy_count = cy_count.head(MAX_CITY_YEARS_TO_SCAN)
+
+print("Candidate city-years:", cy_count.shape)
+
+# ============================================================
+# 6. Match within one city-year
+# ============================================================
+
+evi_full_cols = [f"EVI_full_m{m:02d}" for m in range(1, 13)]
+evi_traj_cols = [f"EVI_m{m:02d}" for m in TRAJ_MONTHS]
+lst_traj_cols = [f"LST_m{m:02d}" for m in TRAJ_MONTHS]
+
+warm_idx = np.array([TRAJ_MONTHS.index(m) for m in WARM_MONTHS], dtype=int)
+months_arr = np.array(TRAJ_MONTHS, dtype=int)
+
+def match_one_city_year(g):
+    g = g.replace([np.inf, -np.inf], np.nan)
+    g = g.dropna(subset=["t_EVI_onset_month"] + control_cols + lst_traj_cols + evi_traj_cols)
+
+    if len(g) < MIN_PIXEL_YEARS_CITY_YEAR:
+        return None, None
+
+    q_early = g["t_EVI_onset_month"].quantile(EARLY_Q)
+    q_late = g["t_EVI_onset_month"].quantile(LATE_Q)
+
+    early = g[g["t_EVI_onset_month"] <= q_early].copy()
+    late = g[g["t_EVI_onset_month"] >= q_late].copy()
+
+    if len(early) < MIN_MATCHED_PAIRS or len(late) < MIN_MATCHED_PAIRS:
+        return None, None
+
+    if len(early) > MAX_EARLY_PER_CITY_YEAR:
+        early = early.sample(n=MAX_EARLY_PER_CITY_YEAR, random_state=RANDOM_SEED)
+
+    if len(late) > MAX_LATE_PER_CITY_YEAR:
+        late = late.sample(n=MAX_LATE_PER_CITY_YEAR, random_state=RANDOM_SEED)
+
+    scaler = StandardScaler()
+    scaler.fit(pd.concat([early[control_cols], late[control_cols]], axis=0).astype(float).values)
+
+    X_early = scaler.transform(early[control_cols].astype(float).values)
+    X_late = scaler.transform(late[control_cols].astype(float).values)
+
+    k = min(K_CANDIDATES, len(late))
+    nn = NearestNeighbors(n_neighbors=k)
+    nn.fit(X_late)
+
+    dist, idx = nn.kneighbors(X_early)
+
+    early_evi_full = early[evi_full_cols].values.astype(float)
+    late_evi_full = late[evi_full_cols].values.astype(float)
+
+    early_lst = early[lst_traj_cols].values.astype(float)
+    late_lst = late[lst_traj_cols].values.astype(float)
+
+    selected = []
+
+    for i in range(len(early)):
+        e_onset = early["t_EVI_onset_month"].iloc[i]
+        best = None
+
+        for kk in range(k):
+            j = idx[i, kk]
+            control_distance = dist[i, kk]
+
+            if control_distance > MAX_CONTROL_DISTANCE:
+                continue
+
+            l_onset = late["t_EVI_onset_month"].iloc[j]
+            onset_gap = l_onset - e_onset
+
+            if onset_gap <= 0:
+                continue
+
+            if USE_SHAPE_FILTER:
+                rmse = evi_shape_rmse_after_shift(
+                    early_evi_full[i],
+                    late_evi_full[j],
+                    onset_gap
+                )
+
+                if (not np.isfinite(rmse)) or (rmse > MAX_EVI_SHAPE_RMSE):
+                    continue
+            else:
+                rmse = np.nan
+
+            score = control_distance + 8.0 * (rmse if np.isfinite(rmse) else 0) + 0.10 * abs(onset_gap)
+
+            if best is None or score < best["score"]:
+                best = {
+                    "early_i": i,
+                    "late_j": j,
+                    "control_distance": control_distance,
+                    "evi_shape_rmse": rmse,
+                    "onset_gap": onset_gap,
+                    "score": score
+                }
+
+        if best is not None:
+            selected.append(best)
+
+    if len(selected) < MIN_MATCHED_PAIRS:
+        return None, None
+
+    pair_rows = []
+
+    for s in selected:
+        i = s["early_i"]
+        j = s["late_j"]
+
+        e = early.iloc[i]
+        l = late.iloc[j]
+
+        e_lst = early_lst[i]
+        l_lst = late_lst[j]
+
+        e_met = compute_observed_metrics(e_lst, warm_idx, months_arr)
+        l_met = compute_observed_metrics(l_lst, warm_idx, months_arr)
+
+        row = {
+            "sample_city_id": int(e["sample_city_id"]),
+            "sample_city_name": str(e["sample_city_name"]),
+            "sample_year": int(e["sample_year"]),
+            "early_pixel_key": e["pixel_key"],
+            "late_pixel_key": l["pixel_key"],
+
+            "early_onset_month": float(e["t_EVI_onset_month"]),
+            "late_onset_month": float(l["t_EVI_onset_month"]),
+            "onset_gap_months": float(s["onset_gap"]),
+
+            "control_distance": float(s["control_distance"]),
+            "evi_shape_rmse": float(s["evi_shape_rmse"]) if np.isfinite(s["evi_shape_rmse"]) else np.nan,
+            "match_score": float(s["score"]),
+
+            "early_warm_p95": e_met["warm_p95"],
+            "late_warm_p95": l_met["warm_p95"],
+            "observed_d_warm_p95": e_met["warm_p95"] - l_met["warm_p95"],
+            "observed_cooling_p95": l_met["warm_p95"] - e_met["warm_p95"],
+
+            "early_heat_load": e_met["heat_load"],
+            "late_heat_load": l_met["heat_load"],
+            "observed_d_heat_load": e_met["heat_load"] - l_met["heat_load"],
+            "observed_cooling_heat_load": l_met["heat_load"] - e_met["heat_load"],
+
+            "early_peak_doy": e_met["peak_doy"],
+            "late_peak_doy": l_met["peak_doy"],
+            "observed_d_peak_time": e_met["peak_doy"] - l_met["peak_doy"],
+        }
+
+        for mm, m in enumerate(TRAJ_MONTHS):
+            row[f"early_LST_m{m:02d}"] = float(e_lst[mm])
+            row[f"late_LST_m{m:02d}"] = float(l_lst[mm])
+            row[f"cooling_m{m:02d}"] = float(l_lst[mm] - e_lst[mm])
+
+            row[f"early_EVI_m{m:02d}"] = float(e[f"EVI_m{m:02d}"])
+            row[f"late_EVI_m{m:02d}"] = float(l[f"EVI_m{m:02d}"])
+
+        pair_rows.append(row)
+
+    pairs = pd.DataFrame(pair_rows)
+
+    # Balance
+    matched_early = early.iloc[[s["early_i"] for s in selected]].copy()
+    matched_late = late.iloc[[s["late_j"] for s in selected]].copy()
+
+    before_smd = []
+    after_smd = []
+
+    for c in control_cols:
+        before_smd.append(abs(standardized_mean_difference(early[c], late[c])))
+        after_smd.append(abs(standardized_mean_difference(matched_early[c], matched_late[c])))
+
+    summary = {
+        "sample_city_id": int(pairs["sample_city_id"].iloc[0]),
+        "sample_city_name": str(pairs["sample_city_name"].iloc[0]),
+        "sample_year": int(pairs["sample_year"].iloc[0]),
+
+        "n_pairs": int(len(pairs)),
+        "mean_onset_gap_months": float(pairs["onset_gap_months"].mean()),
+
+        "mean_observed_d_warm_p95": float(pairs["observed_d_warm_p95"].mean()),
+        "median_observed_d_warm_p95": float(pairs["observed_d_warm_p95"].median()),
+        "frac_pairs_p95_cooling": float((pairs["observed_d_warm_p95"] < 0).mean()),
+
+        "mean_observed_d_heat_load": float(pairs["observed_d_heat_load"].mean()),
+        "median_observed_d_heat_load": float(pairs["observed_d_heat_load"].median()),
+        "frac_pairs_heat_load_reduction": float((pairs["observed_d_heat_load"] < 0).mean()),
+
+        "mean_observed_d_peak_time": float(pairs["observed_d_peak_time"].mean()),
+        "median_observed_d_peak_time": float(pairs["observed_d_peak_time"].median()),
+        "frac_pairs_peak_delayed": float((pairs["observed_d_peak_time"] > 0).mean()),
+
+        "mean_control_distance": float(pairs["control_distance"].mean()),
+        "mean_evi_shape_rmse": float(pairs["evi_shape_rmse"].mean()),
+        "before_smd_mean_abs": float(np.nanmean(before_smd)),
+        "after_smd_mean_abs": float(np.nanmean(after_smd)),
+    }
+
+    # Ranking score: prefer similarity + ML-consistent signs
+    # More negative p95/heat_load and more positive peak_time are better.
+    summary["ml_consistency_score"] = (
+        -5.0 * summary["mean_observed_d_warm_p95"]
+        -0.05 * summary["mean_observed_d_heat_load"]
+        +0.05 * summary["mean_observed_d_peak_time"]
+        -0.5 * summary["after_smd_mean_abs"]
+        -0.8 * summary["mean_evi_shape_rmse"]
+    )
+
+    return pairs, summary
+
+# ============================================================
+# 7. Scan city-years and choose representative case
+# ============================================================
+
+all_summaries = []
+all_pair_files = []
+
+for _, r in cy_count.iterrows():
+    city_id = r["sample_city_id"]
+    year = r["sample_year"]
+
+    g = py[(py["sample_city_id"] == city_id) & (py["sample_year"] == year)].copy()
+
+    pairs, summary = match_one_city_year(g)
+
+    if pairs is None:
+        continue
+
+    all_summaries.append(summary)
+
+    fp = os.path.join(
+        OUT_DIR,
+        f"pairs_city{int(city_id)}_{str(summary['sample_city_name']).replace(' ', '_')}_{int(year)}.csv"
+    )
+    pairs.to_csv(fp, index=False)
+    all_pair_files.append(fp)
+
+    print(
+        f"Matched {summary['sample_city_name']} {year}: "
+        f"n={summary['n_pairs']}, "
+        f"dP95={summary['mean_observed_d_warm_p95']:.3f}, "
+        f"dHeat={summary['mean_observed_d_heat_load']:.3f}, "
+        f"dPeak={summary['mean_observed_d_peak_time']:.2f}, "
+        f"score={summary['ml_consistency_score']:.3f}"
+    )
+
+summ_df = pd.DataFrame(all_summaries)
+
+if summ_df.empty:
+    raise ValueError(
+        "No valid city-year matched case found. "
+        "Try increasing MAX_CONTROL_DISTANCE or MAX_EVI_SHAPE_RMSE."
+    )
+
+summ_df = summ_df.sort_values("ml_consistency_score", ascending=False).reset_index(drop=True)
+
+summary_fp = os.path.join(OUT_DIR, "observed_matching_ML_metric_cityyear_summaries.csv")
+summ_df.to_csv(summary_fp, index=False)
+
+print("\n=== Top representative observed matched city-years ===")
+print(summ_df.head(15).to_string(index=False))
+
+best = summ_df.iloc[0]
+best_city_id = int(best["sample_city_id"])
+best_city_name = str(best["sample_city_name"])
+best_year = int(best["sample_year"])
+
+best_pairs_fp = os.path.join(
+    OUT_DIR,
+    f"pairs_city{best_city_id}_{best_city_name.replace(' ', '_')}_{best_year}.csv"
+)
+
+best_pairs = pd.read_csv(best_pairs_fp)
+
+print("\n=== Selected representative city-year ===")
+print(best.to_string())
+
+# ============================================================
+# 8. Monthly trajectory for best city-year
+# ============================================================
+
+traj_rows = []
+
+for m in TRAJ_MONTHS:
+    vals = best_pairs[f"cooling_m{m:02d}"].replace([np.inf, -np.inf], np.nan).dropna()
+
+    traj_rows.append({
+        "month": int(m),
+        "mean_cooling": float(vals.mean()),
+        "median_cooling": float(vals.median()),
+        "q25": float(vals.quantile(0.25)),
+        "q75": float(vals.quantile(0.75)),
+        "se": float(vals.std() / np.sqrt(len(vals))) if len(vals) > 1 else np.nan,
+        "frac_positive": float((vals > 0).mean()),
+        "n": int(len(vals)),
+    })
+
+traj = pd.DataFrame(traj_rows)
+traj_fp = os.path.join(OUT_DIR, "selected_cityyear_monthly_LST_trajectory_cooling.csv")
+traj.to_csv(traj_fp, index=False)
+
+print("\n=== Selected city-year monthly cooling trajectory ===")
+print(traj.to_string(index=False))
+
+# Mean trajectories
+months = np.array(TRAJ_MONTHS)
+
+early_evi = np.array([best_pairs[f"early_EVI_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+late_evi = np.array([best_pairs[f"late_EVI_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+
+early_lst = np.array([best_pairs[f"early_LST_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+late_lst = np.array([best_pairs[f"late_LST_m{m:02d}"].mean() for m in TRAJ_MONTHS])
+cooling = late_lst - early_lst
+
+# ============================================================
+# 9. Plot representative observed matching
+# ============================================================
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 140,
+    "savefig.dpi": 300,
+})
+
+fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.8))
+axes = axes.ravel()
+
+# a EVI
+ax = axes[0]
+ax.plot(months, early_evi, marker="o", linewidth=2.3, label="Earlier EVI trajectory")
+ax.plot(months, late_evi, marker="s", linewidth=2.0, label="Later EVI trajectory")
+ax.set_xlabel("Month")
+ax.set_ylabel("EVI")
+ax.set_title(f"a  Matched EVI trajectories\n{best_city_name}, {best_year}", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+ax.legend(frameon=False)
+
+# b LST
+ax = axes[1]
+ax.plot(months, early_lst, marker="o", linewidth=2.3, label="Earlier EVI")
+ax.plot(months, late_lst, marker="s", linewidth=2.0, label="Later EVI")
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+ax.set_xlabel("Month")
+ax.set_ylabel("LST anomaly (°C)")
+ax.set_title("b  Matched LST anomaly trajectories", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+ax.legend(frameon=False)
+
+# c cooling trajectory
+ax = axes[2]
+ax.plot(traj["month"], traj["mean_cooling"], marker="o", linewidth=2.3, color="#365C6A")
+ax.fill_between(
+    traj["month"],
+    traj["mean_cooling"] - 1.96 * traj["se"],
+    traj["mean_cooling"] + 1.96 * traj["se"],
+    color="#365C6A",
+    alpha=0.15
+)
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+ax.set_xlabel("Month")
+ax.set_ylabel("Cooling: later − earlier LST anomaly (°C)")
+ax.set_title("c  Observed LST trajectory difference", loc="left", fontweight="bold")
+ax.grid(True, linestyle=":", alpha=0.3)
+
+# d metric comparison
+metric_names = ["P95 LST", "Heat load", "Peak timing"]
+metric_vals = [
+    best["mean_observed_d_warm_p95"],
+    best["mean_observed_d_heat_load"],
+    best["mean_observed_d_peak_time"],
+]
+
+ax = axes[3]
+bars = ax.bar(metric_names, metric_vals, alpha=0.85)
+ax.axhline(0, color="gray", linestyle="--", linewidth=1.0)
+ax.set_ylabel("Early − late")
+ax.set_title("d  ML-aligned observed metrics", loc="left", fontweight="bold")
+ax.grid(axis="y", linestyle=":", alpha=0.3)
+
+for i, v in enumerate(metric_vals):
+    ax.text(i, v, f"{v:.2f}", ha="center", va="bottom" if v >= 0 else "top", fontsize=9)
+
+plt.tight_layout()
+
+fig_png = os.path.join(OUT_DIR, "FigS_selected_observed_matching_ML_metrics.png")
+fig_pdf = os.path.join(OUT_DIR, "FigS_selected_observed_matching_ML_metrics.pdf")
+fig.savefig(fig_png, dpi=300, bbox_inches="tight")
+fig.savefig(fig_pdf, bbox_inches="tight")
+plt.show()
+
+print("Saved figure:")
+print(fig_png)
+print(fig_pdf)
+
+# ============================================================
+# 10. Write report
+# ============================================================
+
+settings = {
+    "DATA_PATH": DATA_PATH,
+    "EARLY_Q": EARLY_Q,
+    "LATE_Q": LATE_Q,
+    "TRAJ_MONTHS": TRAJ_MONTHS,
+    "WARM_MONTHS": WARM_MONTHS,
+    "PRE_MONTHS": PRE_MONTHS,
+    "CLIM_MONTHS": CLIM_MONTHS,
+    "MAX_PIXEL_YEARS_PER_CITY_YEAR": MAX_PIXEL_YEARS_PER_CITY_YEAR,
+    "MAX_CITY_YEARS_TO_SCAN": MAX_CITY_YEARS_TO_SCAN,
+    "MAX_CONTROL_DISTANCE": MAX_CONTROL_DISTANCE,
+    "USE_SHAPE_FILTER": USE_SHAPE_FILTER,
+    "MAX_EVI_SHAPE_RMSE": MAX_EVI_SHAPE_RMSE,
+    "MIN_MATCHED_PAIRS": MIN_MATCHED_PAIRS,
+    "control_cols": control_cols,
+}
+
+report_path = os.path.join(OUT_DIR, "observed_matching_ML_metrics_report.txt")
+
+with open(report_path, "w") as f:
+    f.write("Observed matching analogue of ML timing-shift metrics\n")
+    f.write("====================================================\n\n")
+
+    f.write("Purpose:\n")
+    f.write(
+        "This analysis selects representative city-years in which earlier and later EVI trajectories "
+        "are matched under similar static background, climate trajectory, EVI amount, and pre-LST state. "
+        "It evaluates the same metrics used in the ML timing-shift simulation: warm-season P95 LST, "
+        "heat load, and peak timing.\n\n"
+    )
+
+    f.write("Sign convention:\n")
+    f.write(
+        "observed_d_warm_p95 = early_P95 - late_P95; negative values indicate cooling.\n"
+        "observed_d_heat_load = early_heat_load - late_heat_load; negative values indicate reduced heat load.\n"
+        "observed_d_peak_time = early_peak_time - late_peak_time; positive values indicate delayed peak timing.\n\n"
+    )
+
+    f.write("Settings:\n")
+    f.write(json.dumps(settings, indent=2))
+    f.write("\n\n")
+
+    f.write("Top city-year summaries:\n")
+    f.write(summ_df.head(20).to_string(index=False))
+    f.write("\n\n")
+
+    f.write("Selected representative city-year:\n")
+    f.write(best.to_string())
+    f.write("\n\n")
+
+    f.write("Monthly cooling trajectory:\n")
+    f.write(traj.to_string(index=False))
+    f.write("\n\n")
+
+print("Saved report:")
+print(report_path)
+
+print("\n============================================================")
+print("MANUSCRIPT-READY NUMERIC FACTS")
+print("============================================================")
+print("Selected representative city-year:")
+print(best.to_string())
+print("\nMonthly trajectory:")
+print(traj.to_string(index=False))
+print("\nTop 10 city-years:")
+print(summ_df.head(10).to_string(index=False))
+print("\nOutputs saved to:")
+print(OUT_DIR)
