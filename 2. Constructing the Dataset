@@ -1,0 +1,1611 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# Multi-year CatBoost training dataset builder
+# FAST + DATA-COMPLETE + FINAL SAVED TO GOOGLE DRIVE
+#
+# Revised version:
+#   - Adds previously missing ERA5-Land variables:
+#       ERA5LMAIN.SWVL1
+#       ERA5LMAIN.WIND10M
+#       ERA5LMAIN.STL1
+#   - Uses a new output/cache directory to avoid reading old city caches
+#   - Keeps the original algorithm and sampling design unchanged
+#   - Saves complete sample-level metadata
+#
+# Main design:
+#   1) Read original data from Google Drive.
+#   2) Process and cache intermediate city-level files locally in /content for speed.
+#   3) Save final NPZ/CSV reports to local first.
+#   4) Copy final outputs to Google Drive at the end.
+#   5) Optionally sync city caches to Google Drive every N cities.
+#
+# This version preserves:
+#   X, y, channels
+#   sample_city_id, sample_city_name
+#   sample_year, sample_month, sample_yyyymm
+#   sample_row, sample_col
+#   sample_lon, sample_lat
+#   sample_era_row, sample_era_col
+#   sample_spatial_block_id
+#   sample_city_year, sample_city_year_month
+#
+# Important:
+#   City ID is saved as metadata but is NOT used as model predictor by default.
+# ============================================================
+
+import os
+import re
+import math
+import gc
+import json
+import shutil
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.transform import Affine
+from tqdm import tqdm
+
+
+# ============================================================
+# 0) Config
+# ============================================================
+
+ROOT = "/content/drive/MyDrive/anature_revised/data"
+CITY_INFO = "/content/drive/MyDrive/anature_revised/selected_cities_fullinfo_with_koppen.xlsx"
+
+# ------------------------------------------------------------
+# IMPORTANT:
+# Use NEW local and Drive output directories.
+# Do not reuse old cache directory, otherwise old city caches will be loaded
+# and SWVL1/WIND10M/STL1 will still be missing.
+# ------------------------------------------------------------
+
+LOCAL_OUT_DIR = "/content/multiyear_catboost_npz_with_metadata_fast_local_WITH_SWVL1_WIND10M_STL1"
+LOCAL_CACHE_DIR = os.path.join(LOCAL_OUT_DIR, "city_cache_npz")
+os.makedirs(LOCAL_OUT_DIR, exist_ok=True)
+os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
+
+DRIVE_OUT_DIR = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1"
+DRIVE_CACHE_DIR = os.path.join(DRIVE_OUT_DIR, "city_cache_npz")
+os.makedirs(DRIVE_OUT_DIR, exist_ok=True)
+os.makedirs(DRIVE_CACHE_DIR, exist_ok=True)
+
+# If True, copy local city cache to Drive every N completed cities.
+# This protects progress but can slow down. Recommended: True with every 10 cities.
+SYNC_CITY_CACHE_TO_DRIVE = True
+SYNC_CACHE_EVERY_N_CITIES = 10
+
+FINE_DEG = 0.005
+ERA_DEG  = 0.10
+
+SPATIAL_SUBSAMPLE = 1
+
+YEAR_START = 2013
+YEAR_END   = 2025
+
+MIN_MONTHS_PER_YEAR = 8
+REQUIRE_COMMON_YEARS_ACROSS_CITIES = False
+
+CITY_LIMIT = 100
+CITY_WHITELIST = []
+# For testing:
+# CITY_WHITELIST = ["Abidjan", "Accra", "Shanghai"]
+
+MIN_CITY_SAMPLES = 500
+MIN_CITY_YEARS = 2
+
+# Keep current sampling design.
+MAX_SAMPLES_PER_CITY_MONTH = 3000
+SAMPLE_FRAC = 1.0
+
+RANDOM_SEED = 42
+
+USE_NTL_CORE = False
+NTL_PCT_BRIGHTEST = 99
+NTL_KEYS = {"NTL", "VIIRS", "NIGHT", "NIGHTLIGHT"}
+NTL_MIN_ABS = 0.0
+
+TARGET_PREFS = ("LST.LSTD", "LST.LST_DAY", "LST_DAY")
+EXCLUDE_LST_FEATURES = True
+APPEND_CITY_ID_AS_FEATURE = False
+
+WATER_CODE = 17
+WATER_FRAC_THR = 0.3
+REQUIRE_LAND_PIXEL = True
+
+# ------------------------------------------------------------
+# REQUIRED finite predictors.
+# Revised: add SWVL1, WIND10M, STL1.
+# If STL1 causes too many samples to be dropped, remove "STL1" here,
+# but keep it in KEEP_CHANNEL_SUBSTRINGS so it can still be saved if present.
+# ------------------------------------------------------------
+REQ_SUBSTRINGS = [
+    "EVI", "LAI",
+    "VPD", "SSRD", "TP",
+    "SWVL1", "WIND10M", "STL1",
+    "T2M", "TD"
+]
+
+USE_CHANNEL_PREFILTER = True
+
+# ------------------------------------------------------------
+# Channel prefilter.
+# Revised: add SWVL1, WIND10M, STL1.
+# This is the key modification. Without this, these channels are scanned
+# but removed before dataset construction.
+# ------------------------------------------------------------
+KEEP_CHANNEL_SUBSTRINGS = [
+    "EVI", "LAI",
+
+    # ERA5-Land / climate variables
+    "T2M", "TD", "VPD", "SSRD", "TP",
+    "SWVL1", "WIND10M", "STL1",
+
+    # static / urban variables
+    "LC",
+    "NTL", "VIIRS", "NIGHT", "NIGHTLIGHT",
+    "DEM", "SLOPE",
+    "NDBI", "IMPERV", "BUILT", "URBAN",
+    "WATERDIST", "DISTWATER", "DIST_WATER"
+]
+
+ALWAYS_KEEP_TARGET_HINTS = ["LST"]
+PRUNE_TRIPLES_EARLY = True
+VERBOSE = True
+ALLOW_EXT = {".tif", ".tiff"}
+
+TAG = (
+    f"MULTIYEAR_{YEAR_START}_{YEAR_END}_"
+    f"fine{FINE_DEG}_S{SPATIAL_SUBSAMPLE}_"
+    f"maxCM{MAX_SAMPLES_PER_CITY_MONTH if MAX_SAMPLES_PER_CITY_MONTH is not None else 'ALL'}_"
+    f"TOP{CITY_LIMIT}_WITH_ROWCOL_LOCALFAST_"
+    f"WITH_SWVL1_WIND10M_STL1"
+)
+
+OUT_NPZ = os.path.join(LOCAL_OUT_DIR, f"ALLCITIES_train_xy_{TAG}.npz")
+OUT_CITY_STATS = os.path.join(LOCAL_OUT_DIR, f"city_sampling_stats_{TAG}.csv")
+OUT_CITY_YEAR_MONTH_COUNTS = os.path.join(LOCAL_OUT_DIR, f"city_year_month_sample_counts_{TAG}.csv")
+OUT_PREDICTORS = os.path.join(LOCAL_OUT_DIR, f"final_predictor_channels_{TAG}.csv")
+OUT_MISSING = os.path.join(LOCAL_OUT_DIR, f"feature_missing_rate_{TAG}.csv")
+OUT_YEAR_AUDIT = os.path.join(LOCAL_OUT_DIR, f"city_year_audit_{TAG}.csv")
+OUT_CONFIG = os.path.join(LOCAL_OUT_DIR, f"builder_config_{TAG}.json")
+
+os.environ["GDAL_NUM_THREADS"] = "ALL_CPUS"
+os.environ["GDAL_CACHEMAX"] = "4096"
+
+DATE8  = re.compile(r"(?:^|_)(\d{8})(?:_|$)")
+SUBVAR = re.compile(r"^[A-Za-z0-9]+")
+
+
+# ============================================================
+# 1) Utilities
+# ============================================================
+
+def list_cities(root):
+    return sorted([
+        d for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d))
+    ])
+
+
+def apply_city_whitelist(all_cities, whitelist):
+    if not whitelist:
+        return all_cities
+    picked = [c for c in whitelist if c in all_cities]
+    rest = [c for c in all_cities if c not in picked]
+    return picked + rest
+
+
+def city_files(root, city):
+    cdir = os.path.join(root, city)
+    files = [
+        f for f in sorted(os.listdir(cdir))
+        if os.path.isfile(os.path.join(cdir, f))
+        and os.path.splitext(f)[1].lower() in ALLOW_EXT
+    ]
+    return cdir, files
+
+
+def infer_var_from_filename(filename, city):
+    base = re.sub(rf"^{re.escape(city)}_", "", filename, flags=re.IGNORECASE)
+    return base.split("_")[0].upper()
+
+
+def yyyymm_from_yyyymmdd(d8):
+    return d8[:6] if (d8 and len(d8) == 8) else None
+
+
+def yyyymm_to_year_month(m):
+    return int(m[:4]), int(m[4:6])
+
+
+def parse_band_desc(desc, major_var):
+    subvar, mkey = None, "STATIC"
+
+    if desc:
+        desc = str(desc)
+        m_date = DATE8.search(desc)
+        if m_date:
+            mm = yyyymm_from_yyyymmdd(m_date.group(1))
+            mkey = mm if mm else "STATIC"
+
+        m_sv = SUBVAR.search(desc)
+        if m_sv:
+            subvar = m_sv.group(0).upper()
+
+    if subvar is None:
+        subvar = major_var
+
+    return f"{major_var}.{subvar}", mkey
+
+
+def get_band_descs(ds):
+    descs = list(ds.descriptions) if ds.descriptions and any(ds.descriptions) else [None] * ds.count
+    if len(descs) != ds.count:
+        descs = (descs + [None] * ds.count)[:ds.count]
+    return descs
+
+
+def out_hw(h, w, s):
+    return math.ceil(h / s), math.ceil(w / s)
+
+
+def output_transform(ds, spatial_subsample):
+    return ds.transform * Affine.scale(spatial_subsample, spatial_subsample)
+
+
+def is_categorical_channel(chname):
+    up = str(chname).upper()
+    return up.startswith("LC") or ".LC" in up
+
+
+def read_downsample(ds, b, oh, ow, resampling):
+    arr = ds.read(
+        b,
+        masked=True,
+        out_shape=(oh, ow),
+        resampling=resampling
+    ).astype(np.float32)
+
+    if np.ma.isMaskedArray(arr):
+        arr = arr.filled(np.nan)
+
+    return arr
+
+
+def choose_target_channel(channels):
+    for pref in TARGET_PREFS:
+        for ch in channels:
+            if str(ch).upper().endswith(pref.upper()):
+                return ch
+
+    for ch in channels:
+        up = str(ch).upper()
+        if "LST" in up and "LSTN" not in up and "NIGHT" not in up:
+            return ch
+
+    for ch in channels:
+        if "LST" in str(ch).upper():
+            return ch
+
+    return None
+
+
+def find_ntl_channel(channels):
+    for ch in channels:
+        if any(k in str(ch).upper() for k in NTL_KEYS):
+            return ch
+    return None
+
+
+def build_ntl_core_mask(ntl_img_2d, pct_brightest, ntl_min_abs=0.0):
+    m = np.isfinite(ntl_img_2d)
+    if not m.any():
+        return np.ones_like(ntl_img_2d, dtype=bool)
+    vals = ntl_img_2d[m]
+    q = np.nanpercentile(vals, 100 - pct_brightest)
+    return m & (ntl_img_2d >= max(q, ntl_min_abs))
+
+
+def era5_block_size(fine_deg, era_deg, spatial_subsample):
+    eff_deg = fine_deg * spatial_subsample
+    blk = int(round(era_deg / eff_deg))
+    return max(1, blk)
+
+
+def find_required_feature_indices(channels):
+    req = []
+    upchs = [str(c).upper() for c in channels]
+    for s in REQ_SUBSTRINGS:
+        su = s.upper()
+        hit = None
+        for i, uc in enumerate(upchs):
+            if su in uc:
+                hit = i
+                break
+        if hit is not None:
+            req.append(hit)
+    return sorted(set(req))
+
+
+def infer_water_mask_from_lc(channels, ch2i, static_cache, H2, W2):
+    lc_candidates = [
+        c for c in channels
+        if str(c).upper().startswith("LC") or ".LC" in str(c).upper()
+    ]
+    if not lc_candidates:
+        return None
+
+    lc_ch = lc_candidates[0]
+    lc_idx = ch2i[lc_ch]
+
+    if lc_idx not in static_cache:
+        return None
+
+    lc_img = static_cache[lc_idx]
+    if lc_img.shape != (H2, W2):
+        temp = np.full((H2, W2), np.nan, np.float32)
+        temp[:lc_img.shape[0], :lc_img.shape[1]] = lc_img
+        lc_img = temp
+
+    lc_round = np.rint(lc_img).astype(np.float32)
+    return np.isfinite(lc_round) & (lc_round == float(WATER_CODE))
+
+
+def should_keep_channel(chname):
+    up = str(chname).upper()
+
+    if any(h in up for h in ALWAYS_KEEP_TARGET_HINTS):
+        return True
+
+    if not USE_CHANNEL_PREFILTER:
+        return True
+
+    return any(k.upper() in up for k in KEEP_CHANNEL_SUBSTRINGS)
+
+
+def filter_months_by_year_range(months_all, year_start, year_end):
+    kept = []
+    for m in months_all:
+        if not (m and len(str(m)) >= 6 and str(m)[:4].isdigit()):
+            continue
+        y = int(str(m)[:4])
+        if year_start <= y <= year_end:
+            kept.append(m)
+    return sorted(kept)
+
+
+def summarize_years(months):
+    d = defaultdict(int)
+    for m in months:
+        y, _ = yyyymm_to_year_month(m)
+        d[y] += 1
+    return dict(sorted(d.items()))
+
+
+def keep_years_with_min_months(months, min_months):
+    counts = summarize_years(months)
+    good_years = {y for y, n in counts.items() if n >= min_months}
+    return [m for m in months if int(m[:4]) in good_years]
+
+
+def safe_copy2(src, dst_dir):
+    os.makedirs(dst_dir, exist_ok=True)
+    dst = os.path.join(dst_dir, os.path.basename(src))
+    shutil.copy2(src, dst)
+    return dst
+
+
+# ============================================================
+# 2) Sampling
+# ============================================================
+
+def era5_guided_one_pixel_per_block_waterdrop(
+    valid_mask_2d,
+    block,
+    rng,
+    water_mask_2d=None,
+    water_frac_thr=0.3,
+    require_land_pixel=True
+):
+    H, W = valid_mask_2d.shape
+    Hb = H // block
+    Wb = W // block
+
+    if Hb == 0 or Wb == 0:
+        return np.array([], dtype=np.int64), {
+            "blocks_total": 0,
+            "blocks_used": 0,
+            "blocks_drop_water": 0,
+            "block": int(block)
+        }
+
+    Ht, Wt = Hb * block, Wb * block
+    valid_trim = valid_mask_2d[:Ht, :Wt]
+    valid_blk = valid_trim.reshape(Hb, block, Wb, block).transpose(0, 2, 1, 3)
+    valid_count = valid_blk.sum(axis=(2, 3)).astype(np.int32)
+
+    blocks_total = Hb * Wb
+    usable = valid_count > 0
+    blocks_drop_water = 0
+
+    if water_mask_2d is not None:
+        water_trim = water_mask_2d[:Ht, :Wt]
+        water_blk = water_trim.reshape(Hb, block, Wb, block).transpose(0, 2, 1, 3)
+
+        water_in_valid = (water_blk & valid_blk).sum(axis=(2, 3)).astype(np.int32)
+        water_frac = water_in_valid / np.maximum(valid_count, 1)
+
+        drop_water = (water_frac > water_frac_thr) & usable
+        blocks_drop_water = int(drop_water.sum())
+
+        usable = usable & (~drop_water)
+        land_blk = valid_blk & (~water_blk)
+    else:
+        land_blk = valid_blk
+
+    chosen_list = []
+    blocks_used = 0
+
+    for bi, bj in np.argwhere(usable):
+        if water_mask_2d is not None and require_land_pixel:
+            sub = land_blk[bi, bj]
+            rr, cc = np.where(sub)
+            if rr.size == 0:
+                rr, cc = np.where(valid_blk[bi, bj])
+        else:
+            rr, cc = np.where(valid_blk[bi, bj])
+
+        if rr.size == 0:
+            continue
+
+        pick = rng.integers(0, rr.size)
+        r = bi * block + rr[pick]
+        c = bj * block + cc[pick]
+        chosen_list.append(r * W + c)
+        blocks_used += 1
+
+    return np.array(chosen_list, dtype=np.int64), {
+        "blocks_total": int(blocks_total),
+        "blocks_used": int(blocks_used),
+        "blocks_drop_water": int(blocks_drop_water),
+        "block": int(block)
+    }
+
+
+# ============================================================
+# 3) City scanning and slab building
+# ============================================================
+
+def scan_city_files(root, city):
+    cdir, files = city_files(root, city)
+
+    if not files:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ No tif/tiff files; skip.")
+        return None
+
+    if VERBOSE:
+        print(f"\n[{city}] Detected {len(files)} raster files.")
+
+    example_shape = None
+    example_transform = None
+    example_crs = None
+
+    all_months = set()
+    all_channels = set()
+    index_per_file = []
+
+    for fn in tqdm(files, desc=f"[{city}] Scan", unit="file", disable=not VERBOSE):
+        path = os.path.join(cdir, fn)
+        major = infer_var_from_filename(fn, city)
+
+        try:
+            with rasterio.open(path) as ds:
+                if example_shape is None:
+                    example_shape = (ds.height, ds.width)
+                    example_transform = output_transform(ds, SPATIAL_SUBSAMPLE)
+                    example_crs = ds.crs
+                elif (ds.height, ds.width) != example_shape:
+                    if VERBOSE:
+                        print(f"[{city}] Inconsistent dimensions in {fn}; skip this file.")
+                    continue
+
+                descs = get_band_descs(ds)
+                triples = []
+
+                for b in range(1, ds.count + 1):
+                    ch, mk = parse_band_desc(descs[b - 1], major)
+                    all_channels.add(ch)
+                    if mk != "STATIC":
+                        all_months.add(mk)
+                    triples.append((b, mk, ch))
+
+                index_per_file.append((path, triples))
+
+        except Exception as e:
+            if VERBOSE:
+                print(f"[{city}] [Index skip] {fn}: {repr(e)}")
+
+    if not index_per_file:
+        return None
+
+    return {
+        "index_per_file": index_per_file,
+        "months_all": sorted(all_months),
+        "channels_all": sorted(all_channels),
+        "example_shape": example_shape,
+        "example_transform": example_transform,
+        "example_crs": example_crs
+    }
+
+
+def build_static_cache(index_per_file, channels, ch2i, H2, W2, spatial_subsample):
+    static_cache = {}
+
+    for ch in channels:
+        acc, cnt = None, 0
+
+        for path, triples in index_per_file:
+            for b, mk, c in triples:
+                if c != ch or mk != "STATIC":
+                    continue
+
+                try:
+                    with rasterio.open(path) as ds:
+                        oh, ow = out_hw(ds.height, ds.width, spatial_subsample)
+                        resamp = Resampling.nearest if is_categorical_channel(ch) else Resampling.average
+                        x = read_downsample(ds, b, oh, ow, resamp)
+                except Exception:
+                    continue
+
+                if acc is None:
+                    acc, cnt = x, 1
+                else:
+                    if is_categorical_channel(ch):
+                        m1 = np.isfinite(acc)
+                        m2 = np.isfinite(x)
+                        acc[~m1 & m2] = x[~m1 & m2]
+                    else:
+                        m1 = np.isfinite(acc)
+                        m2 = np.isfinite(x)
+                        both = m1 & m2
+                        acc[~m1 & m2] = x[~m1 & m2]
+                        acc[both] = (acc[both] * cnt + x[both]) / (cnt + 1)
+                        cnt += 1
+
+        if acc is not None:
+            temp = np.full((H2, W2), np.nan, np.float32)
+            temp[:acc.shape[0], :acc.shape[1]] = acc
+            static_cache[ch2i[ch]] = temp
+
+    return static_cache
+
+
+def build_month_dynamic_index(index_per_file, channels, ch2i, months):
+    months_set = set(months)
+    month_index = {m: [] for m in months}
+
+    for path, triples in index_per_file:
+        tmp = defaultdict(lambda: defaultdict(list))
+
+        for b, mk, ch in triples:
+            if mk == "STATIC":
+                continue
+            if mk not in months_set:
+                continue
+            if ch not in ch2i:
+                continue
+
+            c_idx = ch2i[ch]
+            tmp[mk][c_idx].append(b)
+
+        for mk, cdict in tmp.items():
+            month_index[mk].append((path, dict(cdict)))
+
+    return month_index
+
+
+def build_month_slab_fast(month_index, month_key, channels, static_cache, H2, W2, spatial_subsample):
+    C = len(channels)
+
+    SUM = np.zeros((H2, W2, C), np.float32)
+    CNT = np.zeros((H2, W2, C), np.uint16)
+
+    for path, cidx_to_bands in month_index.get(month_key, []):
+        try:
+            with rasterio.open(path) as ds:
+                oh, ow = out_hw(ds.height, ds.width, spatial_subsample)
+
+                for c_idx, band_list in cidx_to_bands.items():
+                    chname = channels[c_idx]
+                    resamp = Resampling.nearest if is_categorical_channel(chname) else Resampling.average
+
+                    data = ds.read(
+                        indexes=sorted(band_list),
+                        masked=True,
+                        out_shape=(len(band_list), oh, ow),
+                        resampling=resamp
+                    ).astype(np.float32)
+
+                    if np.ma.isMaskedArray(data):
+                        data = data.filled(np.nan)
+
+                    if is_categorical_channel(chname):
+                        arr = np.rint(data[0]).astype(np.float32)
+                    else:
+                        with np.errstate(all="ignore"):
+                            arr = np.nanmean(data, axis=0).astype(np.float32)
+
+                    m = np.isfinite(arr)
+                    if m.any():
+                        SUM[:arr.shape[0], :arr.shape[1], c_idx][m] += arr[m]
+                        CNT[:arr.shape[0], :arr.shape[1], c_idx][m] += 1
+
+        except Exception as e:
+            if VERBOSE:
+                print(f"[month read skip] {month_key} {os.path.basename(path)}: {repr(e)}")
+            continue
+
+    slab = np.full((H2, W2, C), np.nan, np.float32)
+
+    valid = CNT > 0
+    slab[valid] = (SUM[valid] / CNT[valid]).astype(np.float32)
+
+    for c_idx, arr in static_cache.items():
+        slab[:, :, c_idx] = arr
+
+    return slab
+
+
+# ============================================================
+# 4) Cache helpers
+# ============================================================
+
+def safe_city_filename(city):
+    return re.sub(r"[^A-Za-z0-9_\-]+", "_", city)
+
+
+def local_city_cache_path(city):
+    return os.path.join(LOCAL_CACHE_DIR, f"{safe_city_filename(city)}_city_samples.npz")
+
+
+def drive_city_cache_path(city):
+    return os.path.join(DRIVE_CACHE_DIR, f"{safe_city_filename(city)}_city_samples.npz")
+
+
+def save_city_cache_local(res):
+    path = local_city_cache_path(res["city"])
+
+    np.savez(
+        path,
+        X=res["X"],
+        y=res["y"],
+        channels=np.array(res["channels"], dtype=object),
+        meta_yyyymm=res["meta_yyyymm"],
+        meta_year=res["meta_year"],
+        meta_month=res["meta_month"],
+        meta_row=res["meta_row"],
+        meta_col=res["meta_col"],
+        meta_lon=res["meta_lon"],
+        meta_lat=res["meta_lat"],
+        meta_era_row=res["meta_era_row"],
+        meta_era_col=res["meta_era_col"],
+        meta_block_id=res["meta_block_id"],
+        city=np.array(res["city"], dtype=object),
+        target_ch=np.array(res["target_ch"], dtype=object),
+        city_stats=np.array(json.dumps(res["city_stats"], ensure_ascii=False), dtype=object),
+        cym_counts=np.array(pd.DataFrame(res["cym_counts"]).to_json(orient="records", force_ascii=False), dtype=object),
+        year_audit=np.array(pd.DataFrame(res["year_audit"]).to_json(orient="records", force_ascii=False), dtype=object)
+    )
+    return path
+
+
+def copy_city_cache_to_drive(city):
+    src = local_city_cache_path(city)
+    if os.path.exists(src):
+        os.makedirs(DRIVE_CACHE_DIR, exist_ok=True)
+        dst = drive_city_cache_path(city)
+        shutil.copy2(src, dst)
+        return dst
+    return None
+
+
+def load_city_cache(city):
+    path = local_city_cache_path(city)
+    if not os.path.exists(path):
+        dpath = drive_city_cache_path(city)
+        if os.path.exists(dpath):
+            os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
+            shutil.copy2(dpath, path)
+
+    if not os.path.exists(path):
+        return None
+
+    z = np.load(path, allow_pickle=True)
+    city_name = str(z["city"].item())
+    city_stats = json.loads(str(z["city_stats"].item()))
+    cym_counts = pd.read_json(str(z["cym_counts"].item())).to_dict("records")
+    year_audit = pd.read_json(str(z["year_audit"].item())).to_dict("records")
+
+    return {
+        "city": city_name,
+        "X": z["X"].astype(np.float32),
+        "y": z["y"].astype(np.float32),
+        "channels": z["channels"].astype(object).tolist(),
+        "target_ch": str(z["target_ch"].item()),
+
+        "meta_yyyymm": z["meta_yyyymm"].astype(object),
+        "meta_year": z["meta_year"].astype(np.int16),
+        "meta_month": z["meta_month"].astype(np.int8),
+
+        "meta_row": z["meta_row"].astype(np.int32),
+        "meta_col": z["meta_col"].astype(np.int32),
+        "meta_lon": z["meta_lon"].astype(np.float32),
+        "meta_lat": z["meta_lat"].astype(np.float32),
+
+        "meta_era_row": z["meta_era_row"].astype(np.int32),
+        "meta_era_col": z["meta_era_col"].astype(np.int32),
+        "meta_block_id": z["meta_block_id"].astype(object),
+
+        "city_stats": city_stats,
+        "cym_counts": cym_counts,
+        "year_audit": year_audit
+    }
+
+
+# ============================================================
+# 5) Process one city
+# ============================================================
+
+def process_one_city_multiyear(root, city, spatial_subsample=1, sample_frac=1.0, rng=None):
+    rng = np.random.default_rng(RANDOM_SEED) if rng is None else rng
+
+    cached = load_city_cache(city)
+    if cached is not None:
+        if VERBOSE:
+            print(f"\n[{city}] ✅ Loaded city cache")
+        return cached
+
+    scan = scan_city_files(root, city)
+    if scan is None:
+        return None
+
+    index_per_file = scan["index_per_file"]
+    months_all = scan["months_all"]
+    channels_all = scan["channels_all"]
+    example_shape = scan["example_shape"]
+    transform_out = scan["example_transform"]
+
+    if len(months_all) == 0:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ No dynamic months; skip.")
+        return None
+
+    months_in_range = filter_months_by_year_range(months_all, YEAR_START, YEAR_END)
+    months = keep_years_with_min_months(months_in_range, MIN_MONTHS_PER_YEAR)
+
+    if len(months) == 0:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ No valid months in {YEAR_START}-{YEAR_END}; skip.")
+        return None
+
+    year_counts_all = summarize_years(months_all)
+    year_counts_used = summarize_years(months)
+
+    if len(year_counts_used) < MIN_CITY_YEARS:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ Too few valid years ({len(year_counts_used)}); skip.")
+        return None
+
+    channels = channels_all
+    if USE_CHANNEL_PREFILTER:
+        channels = [c for c in channels_all if should_keep_channel(c)]
+
+    if VERBOSE:
+        print(f"[{city}] Months available: {len(months_all)}; months used: {len(months)}")
+        print(f"[{city}] Years used: {year_counts_used}")
+        print(f"[{city}] Channels kept: {len(channels_all)} -> {len(channels)}")
+        print(f"[{city}] Kept channels:")
+        for ch in channels:
+            print("  -", ch)
+
+    ch2i = {c: i for i, c in enumerate(channels)}
+
+    target_ch = choose_target_channel(channels)
+    if not target_ch:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ Target LST not found; skip.")
+        return None
+
+    y_cidx = ch2i[target_ch]
+
+    if PRUNE_TRIPLES_EARLY:
+        months_set = set(months)
+        channels_set = set(channels)
+
+        pruned = []
+        for path, triples in index_per_file:
+            tt = [
+                (b, mk, ch)
+                for (b, mk, ch) in triples
+                if (ch in channels_set) and (mk == "STATIC" or mk in months_set)
+            ]
+            if tt:
+                pruned.append((path, tt))
+
+        index_per_file = pruned
+
+    H, W = example_shape
+    H2, W2 = out_hw(H, W, spatial_subsample)
+    C = len(channels)
+
+    if VERBOSE:
+        print(f"[{city}] C={C}; H2xW2={H2}x{W2}; target={target_ch}")
+
+    static_cache = build_static_cache(
+        index_per_file=index_per_file,
+        channels=channels,
+        ch2i=ch2i,
+        H2=H2,
+        W2=W2,
+        spatial_subsample=spatial_subsample
+    )
+
+    month_index = build_month_dynamic_index(
+        index_per_file=index_per_file,
+        channels=channels,
+        ch2i=ch2i,
+        months=months
+    )
+
+    if USE_NTL_CORE:
+        ntl_ch = find_ntl_channel(channels)
+        if ntl_ch is not None and ch2i[ntl_ch] in static_cache:
+            ntl_img = static_cache[ch2i[ntl_ch]]
+            core_mask = build_ntl_core_mask(ntl_img, NTL_PCT_BRIGHTEST, NTL_MIN_ABS)
+        else:
+            core_mask = np.ones((H2, W2), dtype=bool)
+    else:
+        core_mask = np.ones((H2, W2), dtype=bool)
+
+    water_mask = infer_water_mask_from_lc(
+        channels=channels,
+        ch2i=ch2i,
+        static_cache=static_cache,
+        H2=H2,
+        W2=W2
+    )
+
+    block = era5_block_size(FINE_DEG, ERA_DEG, spatial_subsample)
+
+    pix_idx, blk_stats = era5_guided_one_pixel_per_block_waterdrop(
+        valid_mask_2d=core_mask,
+        block=block,
+        rng=rng,
+        water_mask_2d=water_mask,
+        water_frac_thr=WATER_FRAC_THR,
+        require_land_pixel=REQUIRE_LAND_PIXEL
+    )
+
+    if pix_idx.size == 0:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ No sampled pixels; skip.")
+        return None
+
+    pix_row_all = (pix_idx // W2).astype(np.int32)
+    pix_col_all = (pix_idx % W2).astype(np.int32)
+
+    try:
+        xs, ys = rasterio.transform.xy(transform_out, pix_row_all, pix_col_all, offset="center")
+        pix_lon_all = np.asarray(xs, dtype=np.float32)
+        pix_lat_all = np.asarray(ys, dtype=np.float32)
+    except Exception:
+        pix_lon_all = np.full(pix_idx.size, np.nan, dtype=np.float32)
+        pix_lat_all = np.full(pix_idx.size, np.nan, dtype=np.float32)
+
+    pix_era_row_all = (pix_row_all // block).astype(np.int32)
+    pix_era_col_all = (pix_col_all // block).astype(np.int32)
+
+    req_idx_city = find_required_feature_indices(channels)
+
+    if VERBOSE:
+        print(f"[{city}] Required finite predictor indices:")
+        for idx in req_idx_city:
+            print(f"  {idx}: {channels[idx]}")
+
+    X_list, y_list = [], []
+
+    meta_yyyymm, meta_year, meta_month = [], [], []
+    meta_row, meta_col, meta_lon, meta_lat = [], [], [], []
+    meta_era_row, meta_era_col, meta_block_id = [], [], []
+
+    cym_counts = []
+
+    for i_m, mkey in enumerate(
+        tqdm(months, desc=f"[{city}] Build city-month samples", unit="month", disable=not VERBOSE),
+        start=1
+    ):
+        year, month = yyyymm_to_year_month(mkey)
+
+        slab = build_month_slab_fast(
+            month_index=month_index,
+            month_key=mkey,
+            channels=channels,
+            static_cache=static_cache,
+            H2=H2,
+            W2=W2,
+            spatial_subsample=spatial_subsample
+        )
+
+        feat = slab.reshape(-1, C)[pix_idx]
+        yy = slab[..., y_cidx].reshape(-1)[pix_idx]
+
+        valid = np.isfinite(yy)
+
+        if req_idx_city:
+            valid = valid & np.all(np.isfinite(feat[:, req_idx_city]), axis=1)
+
+        if not valid.any():
+            cym_counts.append({
+                "city": city,
+                "yyyymm": mkey,
+                "year": year,
+                "month": month,
+                "n_valid": 0,
+                "n_after_cap": 0
+            })
+            del slab, feat, yy
+            if i_m % 12 == 0:
+                gc.collect()
+            continue
+
+        valid_pos = np.where(valid)[0]
+
+        feat_valid = feat[valid_pos]
+        yy_valid = yy[valid_pos]
+
+        row_valid = pix_row_all[valid_pos]
+        col_valid = pix_col_all[valid_pos]
+        lon_valid = pix_lon_all[valid_pos]
+        lat_valid = pix_lat_all[valid_pos]
+        era_row_valid = pix_era_row_all[valid_pos]
+        era_col_valid = pix_era_col_all[valid_pos]
+
+        n_valid = feat_valid.shape[0]
+
+        if MAX_SAMPLES_PER_CITY_MONTH is not None and n_valid > MAX_SAMPLES_PER_CITY_MONTH:
+            keep = rng.choice(n_valid, size=MAX_SAMPLES_PER_CITY_MONTH, replace=False)
+
+            feat_valid = feat_valid[keep]
+            yy_valid = yy_valid[keep]
+
+            row_valid = row_valid[keep]
+            col_valid = col_valid[keep]
+            lon_valid = lon_valid[keep]
+            lat_valid = lat_valid[keep]
+            era_row_valid = era_row_valid[keep]
+            era_col_valid = era_col_valid[keep]
+
+        n_after = feat_valid.shape[0]
+
+        block_id_valid = np.array([
+            f"{city}_er{er}_ec{ec}"
+            for er, ec in zip(era_row_valid, era_col_valid)
+        ], dtype=object)
+
+        X_list.append(feat_valid.astype(np.float32))
+        y_list.append(yy_valid.astype(np.float32))
+
+        meta_yyyymm.extend([mkey] * n_after)
+        meta_year.extend([year] * n_after)
+        meta_month.extend([month] * n_after)
+
+        meta_row.append(row_valid.astype(np.int32))
+        meta_col.append(col_valid.astype(np.int32))
+        meta_lon.append(lon_valid.astype(np.float32))
+        meta_lat.append(lat_valid.astype(np.float32))
+        meta_era_row.append(era_row_valid.astype(np.int32))
+        meta_era_col.append(era_col_valid.astype(np.int32))
+        meta_block_id.append(block_id_valid)
+
+        cym_counts.append({
+            "city": city,
+            "yyyymm": mkey,
+            "year": year,
+            "month": month,
+            "n_valid": int(n_valid),
+            "n_after_cap": int(n_after)
+        })
+
+        del slab, feat, yy, feat_valid, yy_valid
+
+        if i_m % 12 == 0:
+            gc.collect()
+
+    if not X_list:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ No valid city-month samples; skip.")
+        return None
+
+    X_city = np.vstack(X_list).astype(np.float32)
+    y_city = np.concatenate(y_list).astype(np.float32)
+
+    meta_yyyymm = np.array(meta_yyyymm, dtype=object)
+    meta_year = np.array(meta_year, dtype=np.int16)
+    meta_month = np.array(meta_month, dtype=np.int8)
+
+    meta_row = np.concatenate(meta_row).astype(np.int32)
+    meta_col = np.concatenate(meta_col).astype(np.int32)
+    meta_lon = np.concatenate(meta_lon).astype(np.float32)
+    meta_lat = np.concatenate(meta_lat).astype(np.float32)
+    meta_era_row = np.concatenate(meta_era_row).astype(np.int32)
+    meta_era_col = np.concatenate(meta_era_col).astype(np.int32)
+    meta_block_id = np.concatenate(meta_block_id).astype(object)
+
+    if 0 < sample_frac < 1.0 and X_city.shape[0] > 0:
+        keep = rng.choice(
+            X_city.shape[0],
+            size=int(round(sample_frac * X_city.shape[0])),
+            replace=False
+        )
+
+        X_city = X_city[keep]
+        y_city = y_city[keep]
+
+        meta_yyyymm = meta_yyyymm[keep]
+        meta_year = meta_year[keep]
+        meta_month = meta_month[keep]
+        meta_row = meta_row[keep]
+        meta_col = meta_col[keep]
+        meta_lon = meta_lon[keep]
+        meta_lat = meta_lat[keep]
+        meta_era_row = meta_era_row[keep]
+        meta_era_col = meta_era_col[keep]
+        meta_block_id = meta_block_id[keep]
+
+    if X_city.shape[0] < MIN_CITY_SAMPLES:
+        if VERBOSE:
+            print(f"[{city}] ⚠️ Too few samples {X_city.shape[0]}; skip.")
+        return None
+
+    n = X_city.shape[0]
+
+    assert y_city.shape[0] == n
+    assert meta_yyyymm.shape[0] == n
+    assert meta_year.shape[0] == n
+    assert meta_month.shape[0] == n
+    assert meta_row.shape[0] == n
+    assert meta_col.shape[0] == n
+    assert meta_lon.shape[0] == n
+    assert meta_lat.shape[0] == n
+    assert meta_era_row.shape[0] == n
+    assert meta_era_col.shape[0] == n
+    assert meta_block_id.shape[0] == n
+
+    if VERBOSE:
+        print(
+            f"[{city}] Multi-year samples: X={X_city.shape}, y={y_city.shape}; "
+            f"years={int(meta_year.min())}-{int(meta_year.max())}; "
+            f"months={len(set(meta_yyyymm.tolist()))}"
+        )
+
+    city_stats = {
+        "city": city,
+        "n_samples": int(X_city.shape[0]),
+        "n_pix_blocks": int(pix_idx.size),
+        "target_ch": target_ch,
+        "block": int(block),
+        "blocks_total": blk_stats["blocks_total"],
+        "blocks_used": blk_stats["blocks_used"],
+        "blocks_drop_water": blk_stats["blocks_drop_water"],
+        "n_channels_raw": int(len(channels_all)),
+        "n_channels_kept": int(len(channels)),
+        "n_months_available": int(len(months_all)),
+        "n_months_used": int(len(months)),
+        "n_years_used": int(len(set(meta_year.tolist()))),
+        "year_min": int(meta_year.min()),
+        "year_max": int(meta_year.max()),
+        "req_found": int(len(req_idx_city)),
+        "use_ntl_core": bool(USE_NTL_CORE),
+        "water_frac_thr": float(WATER_FRAC_THR),
+        "max_samples_per_city_month": (
+            int(MAX_SAMPLES_PER_CITY_MONTH)
+            if MAX_SAMPLES_PER_CITY_MONTH is not None else -1
+        )
+    }
+
+    year_audit_rows = []
+    all_years = sorted(set(list(year_counts_all.keys()) + list(year_counts_used.keys())))
+    for yy in all_years:
+        year_audit_rows.append({
+            "city": city,
+            "year": yy,
+            "months_available": int(year_counts_all.get(yy, 0)),
+            "months_used": int(year_counts_used.get(yy, 0)),
+            "used": int(yy in year_counts_used)
+        })
+
+    res = {
+        "city": city,
+        "X": X_city,
+        "y": y_city,
+        "channels": channels,
+        "target_ch": target_ch,
+
+        "meta_yyyymm": meta_yyyymm,
+        "meta_year": meta_year,
+        "meta_month": meta_month,
+
+        "meta_row": meta_row,
+        "meta_col": meta_col,
+        "meta_lon": meta_lon,
+        "meta_lat": meta_lat,
+
+        "meta_era_row": meta_era_row,
+        "meta_era_col": meta_era_col,
+        "meta_block_id": meta_block_id,
+
+        "city_stats": city_stats,
+        "cym_counts": cym_counts,
+        "year_audit": year_audit_rows
+    }
+
+    cache_path = save_city_cache_local(res)
+    if VERBOSE:
+        print(f"[{city}] ✅ Local city cache saved: {cache_path}")
+
+    return res
+
+
+# ============================================================
+# 6) Main processing
+# ============================================================
+
+rng = np.random.default_rng(RANDOM_SEED)
+
+all_cities = list_cities(ROOT)
+assert all_cities, f"No city subdirectories found under {ROOT}"
+
+cities_ordered = apply_city_whitelist(all_cities, CITY_WHITELIST)
+
+print(f"Number of cities discovered: {len(all_cities)}")
+print(f"Processing first {CITY_LIMIT} retained cities from: {cities_ordered[:CITY_LIMIT]}")
+print(f"Local output directory: {LOCAL_OUT_DIR}")
+print(f"Final Drive output directory: {DRIVE_OUT_DIR}")
+
+per_city = []
+city_stats_all = []
+cym_counts_all = []
+year_audit_all = []
+processed_since_sync = 0
+
+for city in cities_ordered:
+    if len(per_city) >= CITY_LIMIT:
+        break
+
+    res = process_one_city_multiyear(
+        root=ROOT,
+        city=city,
+        spatial_subsample=SPATIAL_SUBSAMPLE,
+        sample_frac=SAMPLE_FRAC,
+        rng=rng
+    )
+
+    if res is not None:
+        per_city.append(res)
+        city_stats_all.append(res["city_stats"])
+        cym_counts_all.extend(res["cym_counts"])
+        year_audit_all.extend(res["year_audit"])
+
+        processed_since_sync += 1
+
+        if SYNC_CITY_CACHE_TO_DRIVE and processed_since_sync >= SYNC_CACHE_EVERY_N_CITIES:
+            print(f"\nSyncing last {processed_since_sync} city caches to Drive...")
+            for item in per_city[-processed_since_sync:]:
+                dst = copy_city_cache_to_drive(item["city"])
+                if dst:
+                    print("  copied:", dst)
+            processed_since_sync = 0
+
+assert per_city, "No city generated valid multi-year samples."
+
+if SYNC_CITY_CACHE_TO_DRIVE and processed_since_sync > 0:
+    print(f"\nFinal syncing last {processed_since_sync} city caches to Drive...")
+    for item in per_city[-processed_since_sync:]:
+        dst = copy_city_cache_to_drive(item["city"])
+        if dst:
+            print("  copied:", dst)
+
+print(f"\nRetained cities: {len(per_city)}")
+
+
+# ============================================================
+# 7) Optional common-year filtering
+# ============================================================
+
+if REQUIRE_COMMON_YEARS_ACROSS_CITIES:
+    city_year_sets = [set(item["meta_year"].tolist()) for item in per_city]
+    common_years = sorted(set.intersection(*city_year_sets))
+    print(f"Common years across retained cities: {common_years}")
+
+    if not common_years:
+        raise RuntimeError("No common years across all retained cities.")
+
+    new_per_city = []
+
+    for item in per_city:
+        keep = np.isin(item["meta_year"], common_years)
+
+        if keep.sum() < MIN_CITY_SAMPLES:
+            print(f"[{item['city']}] dropped after common-year filtering: {keep.sum()} samples")
+            continue
+
+        for k in [
+            "X", "y",
+            "meta_yyyymm", "meta_year", "meta_month",
+            "meta_row", "meta_col", "meta_lon", "meta_lat",
+            "meta_era_row", "meta_era_col", "meta_block_id"
+        ]:
+            item[k] = item[k][keep]
+
+        item["city_stats"]["n_samples"] = int(item["X"].shape[0])
+        item["city_stats"]["n_years_used"] = int(len(set(item["meta_year"].tolist())))
+        item["city_stats"]["year_min"] = int(item["meta_year"].min())
+        item["city_stats"]["year_max"] = int(item["meta_year"].max())
+
+        new_per_city.append(item)
+
+    per_city = new_per_city
+    assert per_city, "No city left after common-year filtering."
+
+
+# ============================================================
+# 8) Common predictor intersection
+# ============================================================
+
+channel_sets = [set(x["channels"]) for x in per_city]
+common_channels = sorted(set.intersection(*channel_sets))
+
+print(f"Common channels before LST exclusion: {len(common_channels)}")
+print("Common channels before LST exclusion:")
+for ch in common_channels:
+    print("  -", ch)
+
+if EXCLUDE_LST_FEATURES:
+    common_channels = [
+        c for c in common_channels
+        if "LST" not in str(c).upper()
+    ]
+
+print(f"\nFinal feature channels after LST exclusion: {len(common_channels)}")
+
+channels_final = list(common_channels)
+
+if APPEND_CITY_ID_AS_FEATURE:
+    channels_final = common_channels + ["META.CITY_ID"]
+
+
+# ============================================================
+# 9) Merge all cities
+# ============================================================
+
+city2id = {item["city"]: i for i, item in enumerate(per_city)}
+
+allX, ally = [], []
+
+sample_city_id = []
+sample_city_name = []
+sample_year = []
+sample_month = []
+sample_yyyymm = []
+
+sample_row = []
+sample_col = []
+sample_lon = []
+sample_lat = []
+
+sample_era_row = []
+sample_era_col = []
+sample_spatial_block_id = []
+
+sample_city_year = []
+sample_city_year_month = []
+
+for item in per_city:
+    city = item["city"]
+    chs = item["channels"]
+
+    col_idx = [chs.index(c) for c in common_channels]
+    Xc = item["X"][:, col_idx]
+
+    cid = city2id[city]
+
+    if APPEND_CITY_ID_AS_FEATURE:
+        cid_col = np.full((Xc.shape[0], 1), cid, dtype=np.float32)
+        Xc = np.hstack([Xc, cid_col])
+
+    n = Xc.shape[0]
+
+    allX.append(Xc.astype(np.float32))
+    ally.append(item["y"].astype(np.float32))
+
+    sample_city_id.append(np.full(n, cid, dtype=np.int16))
+    sample_city_name.extend([city] * n)
+
+    sample_year.append(item["meta_year"].astype(np.int16))
+    sample_month.append(item["meta_month"].astype(np.int8))
+    sample_yyyymm.extend(item["meta_yyyymm"].tolist())
+
+    sample_row.append(item["meta_row"].astype(np.int32))
+    sample_col.append(item["meta_col"].astype(np.int32))
+    sample_lon.append(item["meta_lon"].astype(np.float32))
+    sample_lat.append(item["meta_lat"].astype(np.float32))
+
+    sample_era_row.append(item["meta_era_row"].astype(np.int32))
+    sample_era_col.append(item["meta_era_col"].astype(np.int32))
+    sample_spatial_block_id.append(item["meta_block_id"].astype(object))
+
+    sample_city_year.extend([f"{city}_{int(y)}" for y in item["meta_year"]])
+    sample_city_year_month.extend([f"{city}_{str(m)}" for m in item["meta_yyyymm"]])
+
+X = np.vstack(allX).astype(np.float32)
+y = np.concatenate(ally).astype(np.float32)
+
+sample_city_id = np.concatenate(sample_city_id).astype(np.int16)
+sample_year = np.concatenate(sample_year).astype(np.int16)
+sample_month = np.concatenate(sample_month).astype(np.int8)
+
+sample_city_name = np.array(sample_city_name, dtype=object)
+sample_yyyymm = np.array(sample_yyyymm, dtype=object)
+
+sample_row = np.concatenate(sample_row).astype(np.int32)
+sample_col = np.concatenate(sample_col).astype(np.int32)
+sample_lon = np.concatenate(sample_lon).astype(np.float32)
+sample_lat = np.concatenate(sample_lat).astype(np.float32)
+
+sample_era_row = np.concatenate(sample_era_row).astype(np.int32)
+sample_era_col = np.concatenate(sample_era_col).astype(np.int32)
+sample_spatial_block_id = np.concatenate(sample_spatial_block_id).astype(object)
+
+sample_city_year = np.array(sample_city_year, dtype=object)
+sample_city_year_month = np.array(sample_city_year_month, dtype=object)
+
+print(f"\n✅ Merge complete")
+print(f"X shape: {X.shape}")
+print(f"y shape: {y.shape}")
+print(f"Retained cities: {len(city2id)}")
+print(f"Year range in samples: {sample_year.min()}-{sample_year.max()}")
+print(f"Unique city-year-months: {len(set(sample_city_year_month.tolist()))}")
+print(f"Feature channels: {len(channels_final)}")
+
+print("\nFinal feature channels:")
+for i, ch in enumerate(channels_final):
+    print(i, ch)
+
+# ============================================================
+# 9.5) Hard check for newly added variables
+# ============================================================
+
+must_have = [
+    "ERA5LMAIN.SWVL1",
+    "ERA5LMAIN.WIND10M",
+    "ERA5LMAIN.STL1"
+]
+
+print("\nCheck newly added variables:")
+for m in must_have:
+    hits = [c for c in channels_final if m.upper() == str(c).upper()]
+    print(f"{m}: {'FOUND' if hits else 'MISSING'}")
+
+missing_must = [
+    m for m in must_have
+    if not any(m.upper() == str(c).upper() for c in channels_final)
+]
+
+if missing_must:
+    raise RuntimeError(
+        "Some required new variables are still missing from final channels: "
+        + ", ".join(missing_must)
+        + "\nPossible reasons:\n"
+        + "1) The original GeoTIFF band descriptions do not contain these exact names.\n"
+        + "2) Not all retained cities share these channels, so they were removed by common-channel intersection.\n"
+        + "3) Old city caches were reused. Make sure the output/cache directory is new.\n"
+        + "4) The variables are named differently, e.g. WIND, WIND10, SWVL, STL, soil temperature.\n"
+    )
+
+
+# ============================================================
+# 10) Hard consistency checks
+# ============================================================
+
+n = y.shape[0]
+
+assert X.shape[0] == n
+assert sample_city_id.shape[0] == n
+assert sample_city_name.shape[0] == n
+assert sample_year.shape[0] == n
+assert sample_month.shape[0] == n
+assert sample_yyyymm.shape[0] == n
+assert sample_row.shape[0] == n
+assert sample_col.shape[0] == n
+assert sample_lon.shape[0] == n
+assert sample_lat.shape[0] == n
+assert sample_era_row.shape[0] == n
+assert sample_era_col.shape[0] == n
+assert sample_spatial_block_id.shape[0] == n
+assert sample_city_year.shape[0] == n
+assert sample_city_year_month.shape[0] == n
+assert len(channels_final) == X.shape[1]
+
+print("\n✅ Metadata consistency check passed.")
+print("Each X/y row has city, year, month, row, col, lon, lat and spatial-block metadata.")
+
+
+# ============================================================
+# 11) Reports
+# ============================================================
+
+missing_rates = []
+for j, ch in enumerate(channels_final):
+    vals = X[:, j]
+    missing_rates.append({
+        "feature": ch,
+        "missing_rate": float(np.mean(~np.isfinite(vals))),
+        "finite_count": int(np.isfinite(vals).sum()),
+        "total_count": int(vals.shape[0])
+    })
+
+df_missing = pd.DataFrame(missing_rates).sort_values("missing_rate", ascending=False)
+
+df_city_stats = pd.DataFrame(city_stats_all).sort_values("city")
+df_cym = pd.DataFrame(cym_counts_all).sort_values(["city", "year", "month"])
+
+df_pred = pd.DataFrame({
+    "feature_index": np.arange(len(channels_final)),
+    "feature": channels_final,
+    "is_city_id": [c == "META.CITY_ID" for c in channels_final],
+    "is_lst_related": ["LST" in str(c).upper() for c in channels_final]
+})
+
+df_year_audit = pd.DataFrame(year_audit_all).sort_values(["city", "year"])
+
+config = {
+    "ROOT": ROOT,
+    "CITY_INFO": CITY_INFO,
+    "YEAR_START": YEAR_START,
+    "YEAR_END": YEAR_END,
+    "MIN_MONTHS_PER_YEAR": MIN_MONTHS_PER_YEAR,
+    "REQUIRE_COMMON_YEARS_ACROSS_CITIES": REQUIRE_COMMON_YEARS_ACROSS_CITIES,
+    "FINE_DEG": FINE_DEG,
+    "ERA_DEG": ERA_DEG,
+    "SPATIAL_SUBSAMPLE": SPATIAL_SUBSAMPLE,
+    "SAMPLE_FRAC": SAMPLE_FRAC,
+    "RANDOM_SEED": RANDOM_SEED,
+    "CITY_LIMIT": CITY_LIMIT,
+    "CITY_WHITELIST": CITY_WHITELIST,
+    "MIN_CITY_SAMPLES": MIN_CITY_SAMPLES,
+    "MIN_CITY_YEARS": MIN_CITY_YEARS,
+    "MAX_SAMPLES_PER_CITY_MONTH": MAX_SAMPLES_PER_CITY_MONTH,
+    "USE_NTL_CORE": USE_NTL_CORE,
+    "NTL_PCT_BRIGHTEST": NTL_PCT_BRIGHTEST,
+    "WATER_CODE": WATER_CODE,
+    "WATER_FRAC_THR": WATER_FRAC_THR,
+    "REQUIRE_LAND_PIXEL": REQUIRE_LAND_PIXEL,
+    "REQ_SUBSTRINGS": REQ_SUBSTRINGS,
+    "USE_CHANNEL_PREFILTER": USE_CHANNEL_PREFILTER,
+    "KEEP_CHANNEL_SUBSTRINGS": KEEP_CHANNEL_SUBSTRINGS,
+    "TARGET_PREFS": TARGET_PREFS,
+    "EXCLUDE_LST_FEATURES": EXCLUDE_LST_FEATURES,
+    "APPEND_CITY_ID_AS_FEATURE": APPEND_CITY_ID_AS_FEATURE,
+    "LOCAL_OUT_DIR": LOCAL_OUT_DIR,
+    "DRIVE_OUT_DIR": DRIVE_OUT_DIR,
+    "LOCAL_CACHE_DIR": LOCAL_CACHE_DIR,
+    "DRIVE_CACHE_DIR": DRIVE_CACHE_DIR,
+    "SYNC_CITY_CACHE_TO_DRIVE": SYNC_CITY_CACHE_TO_DRIVE,
+    "SYNC_CACHE_EVERY_N_CITIES": SYNC_CACHE_EVERY_N_CITIES,
+    "OUT_NPZ_LOCAL": OUT_NPZ,
+    "TAG": TAG,
+    "NEW_VARIABLES_REQUIRED": must_have
+}
+
+
+# ============================================================
+# 12) Save local final outputs first
+# ============================================================
+
+np.savez_compressed(
+    OUT_NPZ,
+    X=X,
+    y=y,
+    channels=np.array(channels_final, dtype=object),
+
+    used_cities=np.array(list(city2id.keys()), dtype=object),
+    city2id=np.array(json.dumps(city2id, ensure_ascii=False), dtype=object),
+
+    sample_city_id=sample_city_id,
+    sample_city_name=sample_city_name,
+    sample_year=sample_year,
+    sample_month=sample_month,
+    sample_yyyymm=sample_yyyymm,
+    sample_city_year=sample_city_year,
+    sample_city_year_month=sample_city_year_month,
+
+    sample_row=sample_row,
+    sample_col=sample_col,
+    sample_lon=sample_lon,
+    sample_lat=sample_lat,
+    sample_era_row=sample_era_row,
+    sample_era_col=sample_era_col,
+    sample_spatial_block_id=sample_spatial_block_id,
+
+    note=np.array(
+        (
+            f"Multi-year CatBoost training dataset with complete sample-level metadata. "
+            f"Years={YEAR_START}-{YEAR_END}; "
+            f"MIN_MONTHS_PER_YEAR={MIN_MONTHS_PER_YEAR}; "
+            f"REQUIRE_COMMON_YEARS_ACROSS_CITIES={REQUIRE_COMMON_YEARS_ACROSS_CITIES}; "
+            f"FINE_DEG={FINE_DEG}; ERA_DEG={ERA_DEG}; "
+            f"SPATIAL_SUBSAMPLE={SPATIAL_SUBSAMPLE}; "
+            f"ERA5 block size={era5_block_size(FINE_DEG, ERA_DEG, SPATIAL_SUBSAMPLE)}; "
+            f"MAX_SAMPLES_PER_CITY_MONTH={MAX_SAMPLES_PER_CITY_MONTH}; "
+            f"USE_NTL_CORE={USE_NTL_CORE}; "
+            f"WATER_FRAC_THR={WATER_FRAC_THR}; "
+            f"REQUIRE_LAND_PIXEL={REQUIRE_LAND_PIXEL}; "
+            f"Required finite predictors={REQ_SUBSTRINGS}; "
+            f"LST-related predictors excluded from X={EXCLUDE_LST_FEATURES}; "
+            f"APPEND_CITY_ID_AS_FEATURE={APPEND_CITY_ID_AS_FEATURE}; "
+            f"Added variables required in final X: {must_have}. "
+            f"Each X/y row has city/year/month/row/col/lon/lat/spatial-block metadata."
+        ),
+        dtype=object
+    )
+)
+
+df_city_stats.to_csv(OUT_CITY_STATS, index=False, encoding="utf-8")
+df_cym.to_csv(OUT_CITY_YEAR_MONTH_COUNTS, index=False, encoding="utf-8")
+df_pred.to_csv(OUT_PREDICTORS, index=False, encoding="utf-8")
+df_missing.to_csv(OUT_MISSING, index=False, encoding="utf-8")
+df_year_audit.to_csv(OUT_YEAR_AUDIT, index=False, encoding="utf-8")
+
+with open(OUT_CONFIG, "w", encoding="utf-8") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+
+print("\n📦 Local final outputs saved:")
+print(OUT_NPZ)
+print(OUT_CITY_STATS)
+print(OUT_CITY_YEAR_MONTH_COUNTS)
+print(OUT_PREDICTORS)
+print(OUT_MISSING)
+print(OUT_YEAR_AUDIT)
+print(OUT_CONFIG)
+
+
+# ============================================================
+# 13) Copy final outputs to Google Drive
+# ============================================================
+
+final_files = [
+    OUT_NPZ,
+    OUT_CITY_STATS,
+    OUT_CITY_YEAR_MONTH_COUNTS,
+    OUT_PREDICTORS,
+    OUT_MISSING,
+    OUT_YEAR_AUDIT,
+    OUT_CONFIG
+]
+
+print("\nCopying final outputs to Google Drive...")
+for f in final_files:
+    dst = safe_copy2(f, DRIVE_OUT_DIR)
+    print("  copied:", dst)
+
+print("\n✅ All final outputs copied to Google Drive:")
+print(DRIVE_OUT_DIR)
+
+print("\n✅ Multi-year CatBoost training NPZ construction complete.")
+print("\nFinal NPZ:")
+print(os.path.join(DRIVE_OUT_DIR, os.path.basename(OUT_NPZ)))
