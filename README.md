@@ -6,6 +6,8 @@ The workflow combines Google Earth Engine exports, multi-source raster harmoniza
 
 This project is a **Google Earth Engine + Google Colab/Python** workflow. It is not a packaged Python library and is not intended to be installed with `pip install`.
 
+The variable-level GeoTIFF inventory, including spatial and temporal metadata for the exported stacks, is available through Figshare at https://doi.org/10.6084/m9.figshare.32494290.
+
 ## Research Questions
 
 The central research questions are:
@@ -316,11 +318,6 @@ contains additional robustness and validation diagnostics, including spatial aut
 
 If you use this code, please cite the associated manuscript:
 
-```text
-Urban vegetation cooling depends on marginal greenness returns.
-```
-
-A full citation can be added here after publication.
 
 ## License
 
