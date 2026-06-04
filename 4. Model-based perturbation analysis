@@ -69,11 +69,11 @@ def clip_feature(name, arr):
     return arr
 
 def positive_deltas_by_1pct_steps(x_series, hi=0.95, pct_step=0.001, max_points=201):
-‘’‘
-Positive perturbations only: Δ starts from 0, incrementing by 1%*mean_pos until reaching (Q95 - mean_pos).
-- mean_pos: Calculates mean only for samples where x > 0
-- If the range is too small, fall back to a very small positive range
-’‘’
+
+#Positive perturbations only: Δ starts from 0, incrementing by 1%*mean_pos until reaching (Q95 - mean_pos).
+#- mean_pos: Calculates mean only for samples where x > 0
+#- If the range is too small, fall back to a very small positive range
+
     x = x_series.to_numpy()
     pos_mask = np.isfinite(x) & (x > 0)
     if pos_mask.sum() == 0:
