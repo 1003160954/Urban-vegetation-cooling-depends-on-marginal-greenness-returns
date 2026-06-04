@@ -1,0 +1,599 @@
+# ============================================================
+# Dependencies
+# ============================================================
+# !pip -q install catboost
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+
+# ============================================================
+# Basic settings
+# ============================================================
+
+plt.rcParams["figure.dpi"] = 120
+
+MODEL_DIR = "/content/GZ_model_20260604_043639/"  # ← Replace with your directory
+
+model_path     = os.path.join(MODEL_DIR, "catboost_model.cbm")
+channels_path  = os.path.join(MODEL_DIR, "channels.npy")
+X_valid_path   = os.path.join(MODEL_DIR, "X_valid.npy")
+y_valid_path   = os.path.join(MODEL_DIR, "y_valid.npy")
+
+assert os.path.exists(model_path), f"Model not found: {model_path}"
+assert os.path.exists(channels_path), f"Feature file not found: {channels_path}"
+assert os.path.exists(X_valid_path) and os.path.exists(y_valid_path), "Verification set file is missing"
+
+
+# ============================================================
+# Load model and validation data
+# ============================================================
+
+model = CatBoostRegressor()
+model.load_model(model_path)
+
+channels = np.load(channels_path, allow_pickle=True).astype(object).tolist()
+X_valid  = np.load(X_valid_path)
+y_valid  = np.load(y_valid_path).astype(np.float32)
+
+print("Original validation set shape:", X_valid.shape)
+
+
+# ============================================================
+# Sampling for acceleration
+# ============================================================
+
+MAX_SAMPLES = 30000  # Adjustable according to speed requirements, such as 20,000 / 50,000.
+
+N_all = X_valid.shape[0]
+
+if N_all > MAX_SAMPLES:
+    rng = np.random.default_rng(123)
+    idx_sample = rng.choice(N_all, size=MAX_SAMPLES, replace=False)
+    X_valid_sub = X_valid[idx_sample]
+    y_valid_sub = y_valid[idx_sample]
+else:
+    X_valid_sub = X_valid
+    y_valid_sub = y_valid
+
+Xv = pd.DataFrame(X_valid_sub, columns=channels)
+
+print("Shape of the validation set after sampling:", Xv.shape)
+print("Partial feature names:", channels[:20])
+
+
+# ============================================================
+# 1. Practical functions:
+# Column lookup / vegetation cleaning / perturbation logic
+# ============================================================
+
+def find_col(patterns, cols):
+    """
+    Find the first column whose name contains any of the given patterns.
+    """
+    for pat in patterns:
+        for c in cols:
+            if pat.lower() in c.lower():
+                return c
+    return None
+
+
+col_temp = find_col(["LST", "T2M", "TEMP"], channels)
+col_vpd  = find_col(["VPD"], channels)
+col_ssrd = find_col(["SSRD", "SWDOWN", "SW"], channels)
+col_wind = find_col(["WIND10", "WIND"], channels)
+col_tp   = find_col(["TP", "PRECIP", "PRCP"], channels)
+col_sm   = find_col(["SWVL1", "SWVL", "SM"], channels)
+
+print("Matched background variable columns:")
+print("  Temp_like :", col_temp)
+print("  VPD       :", col_vpd)
+print("  SSRD      :", col_ssrd)
+print("  WIND10M   :", col_wind)
+print("  TP/Precip :", col_tp)
+print("  SM/SoilW  :", col_sm)
+
+
+def sanitize_veg(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean vegetation variables:
+    - EVI clipped to [0, 1]
+    - LAI clipped to [0, 8]
+    - non-finite values replaced by 0
+    """
+    if "EVI.EVI" in df.columns:
+        x = df["EVI.EVI"].to_numpy(copy=True)
+        x[~np.isfinite(x)] = np.nan
+        x = np.nan_to_num(x, nan=0.0)
+        x = np.clip(x, 0.0, 1.0)
+        df["EVI.EVI"] = x.astype(np.float32)
+
+    if "LAI.LAI" in df.columns:
+        x = df["LAI.LAI"].to_numpy(copy=True)
+        x[~np.isfinite(x)] = np.nan
+        x = np.nan_to_num(x, nan=0.0)
+        x = np.clip(x, 0.0, 8.0)
+        df["LAI.LAI"] = x.astype(np.float32)
+
+    return df
+
+
+Xv = sanitize_veg(Xv)
+
+veg_features = [f for f in ["EVI.EVI", "LAI.LAI"] if f in Xv.columns]
+
+assert veg_features, (
+    "The validation set does not contain EVI.EVI or LAI.LAI. "
+    f"Available columns are: {Xv.columns.tolist()}"
+)
+
+print("Vegetation features:", veg_features)
+
+
+def positive_deltas_by_1pct_steps(
+    x_series,
+    feat_name,
+    hi=0.90,
+    pct_step=0.02,
+    max_points=80
+):
+    """
+    Generate positive perturbation values.
+
+    Preserved logic:
+    - EVI uses a fixed perturbation extension to Δ = 0.6.
+    - LAI uses a fixed perturbation extension to Δ = 2.5.
+    - Other variables fall back to Q_hi - mean_pos.
+
+    Important correction:
+    The previous code computed max_inc but then used np.linspace(0, 1.2, ...),
+    which ignored the intended perturbation range. Here it uses max_inc.
+    """
+    x = x_series.to_numpy()
+    pos_mask = np.isfinite(x) & (x > 0)
+
+    if pos_mask.sum() == 0:
+        return np.array([0.0, 1e-3], dtype=np.float32)
+
+    mean_pos = float(np.mean(x[pos_mask]))
+
+    # Fixed Δ extension for target vegetation variables
+    if feat_name == "EVI.EVI":
+        max_inc = 0.60
+    elif feat_name == "LAI.LAI":
+        max_inc = 2.50
+    else:
+        q_hi = float(np.quantile(x[pos_mask], hi))
+        max_inc = max(0.0, q_hi - mean_pos)
+
+    max_inc = float(max_inc)
+
+    if max_inc <= 1e-8:
+        return np.array([0.0, 1e-4], dtype=np.float32)
+
+    step = max(1e-6, pct_step * max(mean_pos, 1e-6))
+
+    if max_inc < step:
+        return np.array([0.0, max(1e-4, max_inc)], dtype=np.float32)
+
+    n_steps = int(np.floor(max_inc / step)) + 1
+    n_steps = min(n_steps, max_points)
+
+    deltas = np.linspace(0.0, max_inc, n_steps, dtype=np.float32)
+    return deltas
+
+
+def clip_feature(name, arr):
+    """
+    Clip perturbed features to reasonable ranges.
+    """
+    if name == "EVI.EVI":
+        return np.clip(arr, 0.0, 1.0)
+
+    if name == "LAI.LAI":
+        return np.clip(arr, 0.0, 8.0)
+
+    return arr
+
+
+def perturb_and_response_positive_fast(
+    model,
+    X_np,
+    y_base,
+    feat_idx,
+    base_feat_vals,
+    deltas,
+    feature_name
+):
+    """
+    Vectorised accelerated version.
+
+    Inputs:
+    - X_np: numpy array of subset, shape = [n, p]
+    - y_base: observed baseline target, kept for compatibility with original design
+    - feat_idx: index of vegetation feature
+    - base_feat_vals: original feature values
+    - deltas: perturbation array
+    - feature_name: feature name for clipping
+
+    Returns:
+    - mean(pred_perturbed) - mean(pred_baseline) for each Δ
+
+    Note:
+    The baseline uses model prediction under original feature values.
+    This is consistent with perturbation-response analysis.
+    """
+    if X_np.shape[0] == 0:
+        return np.array([], dtype=np.float32)
+
+    mask_pos = np.isfinite(base_feat_vals) & (base_feat_vals > 0)
+
+    if not mask_pos.any():
+        return np.array([], dtype=np.float32)
+
+    X_pos = np.asarray(X_np[mask_pos], dtype=np.float32).copy()
+    y_pos = y_base[mask_pos]  # kept for method compatibility; not used directly
+
+    base_pred = model.predict(X_pos).astype(np.float32)
+    base_mean = float(np.nanmean(base_pred))
+
+    res = []
+    orig_vals = X_pos[:, feat_idx].copy()
+
+    for d in deltas:
+        X_mod = X_pos.copy()
+        new_vals = clip_feature(feature_name, orig_vals + d)
+        X_mod[:, feat_idx] = new_vals.astype(np.float32)
+
+        y_pred = model.predict(X_mod).astype(np.float32)
+        res.append(float(np.nanmean(y_pred) - base_mean))
+
+    return np.array(res, dtype=np.float32)
+
+
+# ============================================================
+# 2. Extracting diagnostic indicators from curves:
+# threshold / saturation point / marginal efficiency
+# ============================================================
+
+def summarize_curve(deltas, response, thr_cooling=-0.1):
+    """
+    Returns:
+    - min_cooling: strongest cooling response
+    - at_delta: corresponding Δ
+    - sat80_delta: 80% saturation point
+    - cat_delta: cooling activation threshold, first time below thr_cooling
+    - mce0: marginal cooling efficiency near Δ≈0
+    - left_slope / right_slope: slopes at both ends of the curve
+    """
+    out = {
+        "min_cooling": np.nan,
+        "at_delta": np.nan,
+        "sat80_delta": np.nan,
+        "cat_delta": np.nan,
+        "mce0": np.nan,
+        "left_slope": np.nan,
+        "right_slope": np.nan,
+    }
+
+    if response.size == 0 or deltas.size == 0:
+        return out
+
+    if np.all(~np.isfinite(response)):
+        return out
+
+    i_min = int(np.nanargmin(response))
+
+    out["min_cooling"] = float(response[i_min])
+    out["at_delta"] = float(deltas[i_min])
+
+    idx_cat = np.where(response <= thr_cooling)[0]
+    if idx_cat.size:
+        out["cat_delta"] = float(deltas[idx_cat[0]])
+
+    target = 0.8 * response[i_min]
+
+    sat_idx = np.where(response <= target)[0]
+    if sat_idx.size:
+        nearest = sat_idx[np.argmin(np.abs(deltas[sat_idx]))]
+        out["sat80_delta"] = float(deltas[nearest])
+
+    if deltas.size >= 3:
+        d0 = deltas[:3]
+        r0 = response[:3]
+        A = np.vstack([d0, np.ones_like(d0)]).T
+        slope, _ = np.linalg.lstsq(A, r0, rcond=None)[0]
+        out["mce0"] = float(slope)
+
+    if deltas.size >= 3:
+        denom_left = deltas[1] - deltas[0]
+        denom_right = deltas[-1] - deltas[-2]
+
+        if abs(denom_left) > 1e-12:
+            out["left_slope"] = float((response[1] - response[0]) / denom_left)
+
+        if abs(denom_right) > 1e-12:
+            out["right_slope"] = float((response[-1] - response[-2]) / denom_right)
+
+    return out
+
+
+# ============================================================
+# 3. Construct background subsets:
+# temperature / VPD / radiation / wind / precipitation / soil moisture
+# ============================================================
+
+N = len(y_valid_sub)
+
+idx_all = np.ones(N, dtype=bool)
+
+q60 = np.quantile(y_valid_sub, 0.60)
+q80 = np.quantile(y_valid_sub, 0.80)
+
+mask_T_mid  = (y_valid_sub >= q60) & (y_valid_sub < q80)
+mask_T_high = y_valid_sub >= q80
+
+subsets = {
+    "All": idx_all,
+    "HighTemp(≥P80)": mask_T_high,
+    "MidTemp([P60,P80))": mask_T_mid,
+}
+
+
+def add_quantile_subsets(col_name, label):
+    """
+    Add high/low background subsets according to P80/P20 of selected variable.
+    """
+    if col_name is None:
+        print(f"[Warning] Column {label} not found; skipping {label} background subset.")
+        return
+
+    v = Xv[col_name].to_numpy()
+
+    valid = np.isfinite(v)
+
+    if valid.sum() == 0:
+        print(f"[Warning] Column {label} has no finite values; skipping.")
+        return
+
+    q20 = np.nanquantile(v, 0.20)
+    q80_local = np.nanquantile(v, 0.80)
+
+    subsets[f"High{label}(≥P80)"] = valid & (v >= q80_local)
+    subsets[f"Low{label}(≤P20)"] = valid & (v <= q20)
+
+
+add_quantile_subsets(col_vpd,  "VPD")
+add_quantile_subsets(col_ssrd, "SSRD")
+add_quantile_subsets(col_wind, "WIND")
+add_quantile_subsets(col_tp,   "TP")
+add_quantile_subsets(col_sm,   "SM")
+
+print("\nSubset definitions:")
+for k, m in subsets.items():
+    print(f"{k:24s}: n={int(m.sum())}")
+
+
+# ============================================================
+# 4. Main analysis:
+# Cooling sensitivity of EVI/LAI under different background conditions
+# Accelerated version
+# ============================================================
+
+results = {}
+
+fig_dir = os.path.join(MODEL_DIR, "figs_fast")
+os.makedirs(fig_dir, exist_ok=True)
+
+X_np_all = Xv.to_numpy(dtype=np.float32, copy=True)
+
+# Safer than using channels directly
+feat2idx = {c: i for i, c in enumerate(Xv.columns)}
+
+
+def get_style(name):
+    """
+    Define colors and line styles for different background subsets.
+    """
+    if name == "All":
+        return "#000000", "-", 3.0
+
+    if "Temp" in name:
+        color = "#d62728"
+        if "HighTemp" in name:
+            ls = "-"
+        elif "MidTemp" in name:
+            ls = "--"
+        else:
+            ls = ":"
+        return color, ls, 2.0
+
+    if "VPD" in name:
+        color = "#ff7f0e"
+        if "HighVPD" in name:
+            ls = "-"
+        elif "LowVPD" in name:
+            ls = "--"
+        else:
+            ls = ":"
+        return color, ls, 2.0
+
+    if "SSRD" in name:
+        color = "#2ca02c"
+        if "HighSSRD" in name:
+            ls = "-"
+        elif "LowSSRD" in name:
+            ls = "--"
+        else:
+            ls = ":"
+        return color, ls, 2.0
+
+    if "WIND" in name:
+        color = "#1f77b4"
+        if "HighWIND" in name:
+            ls = "-"
+        elif "LowWIND" in name:
+            ls = "--"
+        else:
+            ls = ":"
+        return color, ls, 2.0
+
+    if "TP" in name:
+        color = "#9467bd"
+        if "HighTP" in name:
+            ls = "-"
+        elif "LowTP" in name:
+            ls = "--"
+        else:
+            ls = ":"
+        return color, ls, 2.0
+
+    if "SM" in name:
+        color = "#8c564b"
+        if "HighSM" in name:
+            ls = "-"
+        elif "LowSM" in name:
+            ls = "--"
+        else:
+            ls = ":"
+        return color, ls, 2.0
+
+    return "#7f7f7f", "-", 1.5
+
+
+# Paper-style axis settings
+plt.rcParams.update({
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.linewidth": 1.2,
+    "font.size": 11,
+})
+
+
+for feat in veg_features:
+    print(f"\n### Processing feature: {feat} ###")
+
+    feat_res = {}
+
+    if feat not in feat2idx:
+        print(f"[Warning] {feat} not found in Xv columns; skipping.")
+        continue
+
+    feat_idx = feat2idx[feat]
+
+    deltas = positive_deltas_by_1pct_steps(
+        Xv[feat],
+        feat_name=feat,
+        hi=0.98,
+        pct_step=0.02,
+        max_points=80
+    )
+
+    print(f"  Delta range: {float(deltas.min()):.4f} to {float(deltas.max()):.4f}")
+    print(f"  Number of delta points: {len(deltas)}")
+
+    plt.figure(figsize=(7, 5))
+
+    for name, mask in subsets.items():
+        n_sub = int(mask.sum())
+
+        if n_sub < 300:
+            continue
+
+        X_sub_np = X_np_all[mask]
+        y_sub = y_valid_sub[mask]
+        feat_vals_sub = X_sub_np[:, feat_idx]
+
+        resp = perturb_and_response_positive_fast(
+            model=model,
+            X_np=X_sub_np,
+            y_base=y_sub,
+            feat_idx=feat_idx,
+            base_feat_vals=feat_vals_sub,
+            deltas=deltas,
+            feature_name=feat
+        )
+
+        if resp.size == 0:
+            continue
+
+        color, ls, lw = get_style(name)
+
+        plt.plot(
+            deltas,
+            resp,
+            label=name,
+            color=color,
+            linestyle=ls,
+            linewidth=lw
+        )
+
+        feat_res[name] = summarize_curve(
+            deltas,
+            resp,
+            thr_cooling=-0.1
+        )
+
+    plt.axhline(
+        0,
+        color="gray",
+        linestyle=":",
+        linewidth=1
+    )
+
+    plt.xlabel(f"Δ{feat} (Positive disturbance)")
+    plt.ylabel("Δ Predicted LST (°C)")
+    plt.title(f"Sensitivity of {feat} under Different Background Conditions (Fast)")
+
+    # No background grid
+    plt.grid(False)
+
+    plt.legend(fontsize=8, frameon=False)
+    plt.tight_layout()
+
+    safe_feat_name = feat.replace(".", "_").replace("/", "_")
+    fig_path = os.path.join(
+        fig_dir,
+        f"{safe_feat_name}_sensitivity_background_fast.png"
+    )
+
+    plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"  image saved: {fig_path}")
+
+    results[feat] = feat_res
+
+
+# ============================================================
+# Export results
+# ============================================================
+
+out_json = os.path.join(MODEL_DIR, "veg_sensitivity_background_fast.json")
+
+with open(out_json, "w", encoding="utf-8") as f:
+    json.dump(results, f, indent=2, ensure_ascii=False)
+
+print("\n✅ All background mechanisms & threshold diagnostic results have been saved:")
+print(out_json)
+
+
+# ============================================================
+# Print summary
+# ============================================================
+
+for feat in veg_features:
+    print(f"\n== {feat} ==")
+
+    for subset_name, r in results.get(feat, {}).items():
+        print(
+            f"  [{subset_name}] "
+            f"min_cooling={r['min_cooling']:.3f}°C @ Δ={r['at_delta']:.3f} | "
+            f"CAT={r['cat_delta']:.3f} | "
+            f"SCP80={r['sat80_delta']:.3f} | "
+            f"MCE0={r['mce0']:.3f}"
+        )
