@@ -1,0 +1,509 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import numpy as np
+import rasterio
+from tqdm import tqdm
+import pandas as pd
+
+ROOT = "/content/drive/MyDrive/anature_revised/data"
+
+
+CORE_TOP_P = 90
+
+year_pattern = re.compile(r"_(\d{4})\.tif$", re.IGNORECASE)
+
+def pick_latest_file(city, key_substr):
+
+    cdir = os.path.join(ROOT, city)
+    if not os.path.isdir(cdir):
+        return None, None
+    candidates = []
+    for fn in os.listdir(cdir):
+        if key_substr in fn and fn.lower().endswith(".tif"):
+            m = year_pattern.search(fn)
+            if m:
+                candidates.append((int(m.group(1)), fn))
+    if not candidates:
+        return None, None
+    year, fn = sorted(candidates)[-1]
+    return os.path.join(cdir, fn), year
+
+
+results = []
+cities = sorted([d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))])
+print("find city number:", len(cities))
+
+for city in tqdm(cities):
+
+
+    evi_path, evi_year = pick_latest_file(city, "_EVI_8day_0p1deg_")
+    ntl_path, ntl_year = pick_latest_file(city, "_NTL_monthly_0p1deg_")
+
+    if evi_path is None or ntl_path is None:
+        print(f"[{city}] Missing EVI or NTL, skip")
+        continue
+
+
+    with rasterio.open(evi_path) as ds_evi:
+        evi_raw = ds_evi.read().astype(float)
+        evi_raw = np.where(np.isfinite(evi_raw), evi_raw, np.nan)
+        evi_max = np.nanmax(evi_raw, axis=0)
+
+
+    with rasterio.open(ntl_path) as ds_ntl:
+        ntl_raw = ds_ntl.read().astype(float)
+        ntl_raw = np.where(np.isfinite(ntl_raw), ntl_raw, np.nan)
+        if ntl_raw.shape[0] > 1:
+            ntl_annual = np.nanmean(ntl_raw, axis=0)
+        else:
+            ntl_annual = ntl_raw[0]
+
+
+    vals = ntl_annual[np.isfinite(ntl_annual)]
+    if vals.size < 10:
+        print(f"[{city}] Too few NTL values.")
+        continue
+
+    thr = np.nanpercentile(vals, CORE_TOP_P) 
+    core_mask = (ntl_annual >= thr) & np.isfinite(evi_max)
+
+    core_pixels = core_mask.sum()
+    if core_pixels < 10:
+        print(f"[{city}] The core area has too few pixels; skip.")
+        continue
+
+    core_evi = evi_max[core_mask]
+
+
+    results.append({
+        "city": city,
+        "EVI_year": evi_year,
+        "NTL_year": ntl_year,
+        "core_pixels": int(core_pixels),
+        "core_evi_max_mean": float(np.nanmean(core_evi)),
+        "core_prop_evi_ge05": float(np.mean(core_evi >= 0.5)),
+        "core_evi_std": float(np.nanstd(core_evi)),
+    })
+
+df = pd.DataFrame(results)
+
+df_sorted = df.sort_values("core_evi_max_mean", ascending=False).reset_index(drop=True)
+
+num_good = np.sum(df["core_evi_max_mean"] >= 0.5)
+total = len(df)
+
+print("\n================ SUMMARY ================")
+print(f"Effective City:{total}")
+print(f"Cities with an average EVI_max ≥ 0.5 in their core areas：{num_good} ({num_good/total*100:.2f}%)")
+
+print("\nTop 15 cities:")
+print(df_sorted.head(15).to_string(index=False))
+
+out_csv = "/content/EVI_threshold_core_topP_results.csv"
+df_sorted.to_csv(out_csv, index=False)
+print("\nresult saved:", out_csv)
+
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+CSV_PATH = "/content/EVI_threshold_core_topP_results.csv"
+df = pd.read_csv(CSV_PATH)
+
+print("Table column names:", df.columns.tolist())
+print("Number of cities:", len(df))
+
+# ================== 1. Global Statistics ==================
+
+thr_evi = 0.5
+mask_core_mean_ge = df["core_evi_max_mean"] >= thr_evi
+n_city = len(df)
+n_city_core_mean_ge = mask_core_mean_ge.sum()
+
+print("\n===== Bureau Statistics: Average EVI_max Threshold in the Core Area =====")
+print(f"Average in the core areaEVI_max ≥ {thr_evi:.2f} city number: {n_city_core_mean_ge}")
+print(f"Proportion: {n_city_core_mean_ge / n_city * 100:.2f}%")
+
+bins = [0.0, 0.1, 0.3, 0.5, 1.0]
+labels = ["0–10%", "10–30%", "30–50%", ">50%"]
+df["core_prop_bin"] = pd.cut(df["core_prop_evi_ge05"], bins=bins, labels=labels, include_lowest=True)
+
+counts = df["core_prop_bin"].value_counts().reindex(labels)
+print("\nGlobal Statistics: Proportion of Area with EVI_max ≥ 0.5 within the Core Zone Classification")
+for lab, c in counts.items():
+    pct = 100.0 * c / n_city if n_city > 0 else np.nan
+    print(f"{lab:6s}: {int(c):3d} citys，Proportion {pct:5.2f}%")
+
+# 3) Some simple descriptive statistics
+print("\n===== Descriptive statistics =====")
+print("city average EVI_max (core_evi_max_mean):")
+print(df["core_evi_max_mean"].describe())
+
+print("\nurban EVI_max≥0.5 Pixel proportion(core_prop_evi_ge05):")
+print(df["core_prop_evi_ge05"].describe())
+
+# ================== 2. Visualisation ==================
+
+plt.figure(figsize=(14,4))
+
+
+plt.subplot(1,3,1)
+plt.hist(df["core_evi_max_mean"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.axvline(thr_evi, color="red", linestyle="--", label=f"threshold {thr_evi}")
+plt.xlabel("Average EVI_max in the core area")
+plt.ylabel("Number of cities")
+plt.title("Distribution of Average EVI_max in Urban Core Areas")
+plt.legend()
+
+
+plt.subplot(1,3,2)
+plt.hist(df["core_prop_evi_ge05"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.xlabel("Proportion of pixels with EVI_max ≥ 0.5 within the core area")
+plt.ylabel("Number of cities")
+plt.title("Distribution of High Green Space Coverage in Urban Core Areas")
+
+
+plt.subplot(1,3,3)
+plt.scatter(df["core_evi_max_mean"], df["core_prop_evi_ge05"], alpha=0.7)
+plt.axvline(thr_evi, color="red", linestyle="--", linewidth=1)
+plt.axhline(0.5,    color="orange", linestyle="--", linewidth=1)
+plt.xlabel("Average EVI_max in the core area")
+plt.ylabel("Proportion of pixels with EVI_max ≥ 0.5 within the core area")
+plt.title("Green coverage levels in urban core areas and proportion of high-green coverage areas")
+plt.tight_layout()
+plt.show()
+
+# ================== 3. Simple Text Interpretation (Printed to the Console) ==================
+high_green_cities = df.loc[mask_core_mean_ge, "city"].tolist()
+
+
+
+# ================== 4. New Global EVI and LST Time lag Statistics ==================
+import os
+import re
+import itertools
+import numpy as np
+import pandas as pd
+import rasterio
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import ks_2samp
+
+# ============================================================
+
+# ============================================================
+LAG_DIR = "/content/drive/MyDrive/anature_revised/Lag4"
+
+
+# koppen_df columns: ["city_key","koppen"]
+
+TEST_METRIC = "lag_mean"  # "lag_mean" / "lag_median"
+
+SORT_BY = "iqr"  # "iqr" / "std" / "alpha"
+
+MIN_N_PER_ZONE = 5             
+KS_ALTERNATIVE = "two-sided"     # two-sided / less / greater
+
+P_ADJUST = "holm"  # "holm" / "sidak" / "bonferroni" / "none"
+
+
+OUT_ORDER_BASIS = os.path.join(LAG_DIR, f"fig4a_order_basis_{TEST_METRIC}_{SORT_BY}.csv")
+OUT_FIG4A = os.path.join(LAG_DIR, f"fig4a_boxplot_sorted_{TEST_METRIC}_{SORT_BY}.png")
+OUT_FIG4A_ALPHA = os.path.join(LAG_DIR, f"fig4a_boxplot_sorted_{TEST_METRIC}_alpha.png")
+OUT_KS = os.path.join(LAG_DIR, f"pairwise_KS_{TEST_METRIC}_{P_ADJUST}.csv")
+OUT_CITY_TABLE = os.path.join(LAG_DIR, f"city_koppen_{TEST_METRIC}.csv")
+
+# ============================================================
+
+# ============================================================
+tif_files = [f for f in os.listdir(LAG_DIR) if f.endswith(".tif")]
+
+def extract_city(tif):
+    return re.sub(r"_Lag.*", "", tif)
+
+lag_df = pd.DataFrame({
+    "file": tif_files,
+    "city_raw": [extract_city(f) for f in tif_files]
+})
+
+def normalize(name):
+    return re.sub(r"[\s\-\.\(\)]", "", str(name)).lower()
+
+lag_df["city_key"] = lag_df["city_raw"].apply(normalize)
+koppen_df["city_key_norm"] = koppen_df["city_key"].apply(normalize)
+
+# merge：贴上 koppen
+merged = pd.merge(
+    lag_df,
+    koppen_df[["city_key_norm","koppen"]],
+    left_on="city_key",
+    right_on="city_key_norm",
+    how="left"
+)
+
+print("\n=== ===")
+print(merged[["city_raw","koppen"]].head(20))
+
+# ============================================================
+# ============================================================
+df = merged.copy()
+
+lag_means, lag_medians, lag_abs = [], [], []
+
+for _, row in df.iterrows():
+    tif_path = os.path.join(LAG_DIR, row["file"])
+    try:
+        with rasterio.open(tif_path) as ds:
+            arr = ds.read(1, masked=True).astype("float32")  # 单波段
+            vals = arr.compressed()
+            vals = vals[np.isfinite(vals)]
+            if len(vals) == 0:
+                lag_means.append(np.nan)
+                lag_medians.append(np.nan)
+                lag_abs.append(np.nan)
+            else:
+                lag_means.append(float(np.mean(vals)))
+                lag_medians.append(float(np.median(vals)))
+                lag_abs.append(float(np.mean(np.abs(vals))))
+    except Exception as e:
+        lag_means.append(np.nan)
+        lag_medians.append(np.nan)
+        lag_abs.append(np.nan)
+
+df["lag_mean"] = lag_means
+df["lag_median"] = lag_medians
+df["lag_abs_mean"] = lag_abs
+
+df_valid = df.dropna(subset=["koppen", TEST_METRIC]).copy()
+
+df_valid[["city_raw","file","koppen","lag_mean","lag_median","lag_abs_mean"]].to_csv(OUT_CITY_TABLE, index=False)
+print("Saved city-level table:", OUT_CITY_TABLE)
+
+# ============================================================
+
+# ============================================================
+g = df_valid.groupby("koppen")[TEST_METRIC]
+
+order_df = pd.DataFrame({
+    "koppen": g.size().index,
+    "n": g.size().values,
+    "center_median": g.median().values,
+    "center_mean": g.mean().values,
+    "std": g.std(ddof=1).values,
+    "q25": g.quantile(0.25).values,
+    "q75": g.quantile(0.75).values
+})
+order_df["iqr"] = order_df["q75"] - order_df["q25"]
+
+if SORT_BY == "iqr":
+    order = order_df.sort_values(["iqr","koppen"], ascending=[False, True])["koppen"].tolist()
+elif SORT_BY == "std":
+    order = order_df.sort_values(["std","koppen"], ascending=[False, True])["koppen"].tolist()
+elif SORT_BY == "alpha":
+    order = sorted(order_df["koppen"].tolist())
+else:
+    raise ValueError("SORT_BY must be iqr/std/alpha")
+
+order_df_sorted = order_df.set_index("koppen").loc[order].reset_index()
+order_df_sorted.to_csv(OUT_ORDER_BASIS, index=False)
+print("Saved Fig4a ordering basis:", OUT_ORDER_BASIS)
+print("\nTop 10 classes by spread:")
+print(order_df_sorted.head(10))
+
+# ============================================================
+# ============================================================
+plt.figure(figsize=(10, 6))
+sns.boxplot(data=df_valid, x="koppen", y=TEST_METRIC, order=order)
+plt.xticks(rotation=45)
+plt.title(f"Fig 4a | {TEST_METRIC} by Köppen subclasses (sorted by {SORT_BY.upper()} desc)")
+plt.tight_layout()
+plt.savefig(OUT_FIG4A, dpi=300)
+plt.show()
+print("Saved Fig4a:", OUT_FIG4A)
+
+alpha_order = sorted(order_df["koppen"].tolist())
+plt.figure(figsize=(10, 6))
+sns.boxplot(data=df_valid, x="koppen", y=TEST_METRIC, order=alpha_order)
+plt.xticks(rotation=45)
+plt.title(f"Fig 4a (alternative) | {TEST_METRIC} by Köppen subclasses (alphabetical)")
+plt.tight_layout()
+plt.savefig(OUT_FIG4A_ALPHA, dpi=300)
+plt.show()
+print("Saved Fig4a alphabetical:", OUT_FIG4A_ALPHA)
+
+# ============================================================
+# ============================================================
+eligible = order_df.loc[order_df["n"] >= MIN_N_PER_ZONE, "koppen"].tolist()
+print(f"\nEligible subclasses for KS (n>={MIN_N_PER_ZONE}): {eligible}")
+
+pairs = list(itertools.combinations(eligible, 2))
+ks_rows = []
+
+for a, b in pairs:
+    xa = df_valid.loc[df_valid["koppen"] == a, TEST_METRIC].values
+    xb = df_valid.loc[df_valid["koppen"] == b, TEST_METRIC].values
+
+    ks = ks_2samp(xa, xb, alternative=KS_ALTERNATIVE, mode="auto")
+    ks_rows.append({
+        "koppen_a": a, "koppen_b": b,
+        "n_a": len(xa), "n_b": len(xb),
+        "ks_stat": float(ks.statistic),
+        "p_raw": float(ks.pvalue)
+    })
+
+ks_df = pd.DataFrame(ks_rows)
+
+# ---- Holm / Dunn–Šidák / Bonferroni / none
+def p_adjust(pvals, method="holm"):
+    pvals = np.asarray(pvals, dtype=float)
+    out = np.full_like(pvals, np.nan, dtype=float)
+    idx = np.where(np.isfinite(pvals))[0]
+    m = len(idx)
+    if m == 0:
+        return out
+
+    p = pvals[idx]
+    method = (method or "none").lower()
+
+    if method == "none":
+        out[idx] = p
+        return out
+
+    if method == "bonferroni":
+        out[idx] = np.minimum(p * m, 1.0)
+        return out
+
+    if method in ["sidak", "dunn-sidak", "dunnsidak", "dunn–sidak"]:
+        out[idx] = np.minimum(1.0 - (1.0 - p) ** m, 1.0)
+        return out
+
+    if method == "holm":
+        # Holm step-down:
+        # sort p ascending: p_(1)<=...<=p_(m)
+        # adj p_(i) = max_{j<=i} min( (m-j+1)*p_(j), 1 )
+        order = np.argsort(p)
+        p_sorted = p[order]
+        adj_sorted = np.empty_like(p_sorted)
+
+        running_max = 0.0
+        for i in range(m):
+            factor = (m - i)
+            val = min(p_sorted[i] * factor, 1.0)
+            running_max = max(running_max, val)
+            adj_sorted[i] = running_max
+
+        # place back
+        adj = np.empty_like(p)
+        adj[order] = adj_sorted
+        out[idx] = adj
+        return out
+
+    raise ValueError(f"Unknown method: {method}")
+
+ks_df["p_adj"] = p_adjust(ks_df["p_raw"].values, method=P_ADJUST)
+
+ks_df_sorted = ks_df.sort_values(["p_adj","p_raw"], ascending=True).reset_index(drop=True)
+ks_df_sorted.to_csv(OUT_KS, index=False)
+print("\nSaved pairwise KS results:", OUT_KS)
+
+print("\nTop 30 KS comparisons (by p_adj):")
+print(ks_df_sorted.head(30))
+
+# ============================================================
+
+# ============================================================
+print("\n=== Summary for response letter ===")
+print(f"Fig 4a x-axis is sorted by within-class {SORT_BY.upper()} (descending).")
+print(f"Pairwise two-sample KS tests are performed only for subclasses with n >= {MIN_N_PER_ZONE}.")
+print(f"Multiple comparisons are corrected using {P_ADJUST.upper()} method.")
+
+
+# ================== 5. New Global City EVI Statistics ==================
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/ALLCITIES_train_xy_monthly_ERA5guidedREVISED_fine0.005_S2_100pct_TOP100_k1_99.npz"
+
+data = np.load(NPZ_PATH, allow_pickle=True)
+
+X = data["X"]
+y = data["y"]
+channels = data["channels"].tolist()
+used_cities = data["used_cities"].tolist()
+
+print(":", X.shape)
+print(":", len(channels))
+
+# ========= 2. 找到 EVI 和 CITY_ID 列 =========
+evi_idx = None
+for i, ch in enumerate(channels):
+    if "EVI" in ch.upper():
+        evi_idx = i
+        break
+
+city_idx = channels.index("META.CITY_ID")
+
+print("EVI column:", channels[evi_idx])
+print("CITY column:", channels[city_idx])
+
+df = pd.DataFrame({
+    "city_id": X[:, city_idx],
+    "EVI": X[:, evi_idx]
+})
+
+
+df = df[np.isfinite(df["EVI"])]
+
+city_stats = (
+    df.groupby("city_id")
+      .agg(
+          mean_EVI = ("EVI", "mean"),
+          prop_EVI_ge05 = ("EVI", lambda x: np.mean(x >= 0.4)),
+          std_EVI = ("EVI", "std"),
+          n_samples = ("EVI", "size")
+      )
+      .reset_index()
+)
+
+city_stats["city"] = city_stats["city_id"].apply(lambda i: used_cities[int(i)])
+
+print("\n:", len(city_stats))
+print(city_stats.head())
+
+thr = 0.4
+n_city = len(city_stats)
+n_high = np.sum(city_stats["mean_EVI"] >= thr)
+
+print("\n===== GLOBAL SUMMARY =====")
+print(f": {n_city}")
+print(f"mean_EVI ≥ {thr}: {n_high} ({n_high/n_city*100:.2f}%)")
+
+
+plt.figure(figsize=(14,4))
+
+plt.subplot(1,3,1)
+plt.hist(city_stats["mean_EVI"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.axvline(thr, color="red", linestyle="--")
+plt.xlabel("City-level mean EVI")
+plt.ylabel("Number of cities")
+plt.title("Distribution of City Mean EVI")
+
+plt.subplot(1,3,2)
+plt.hist(city_stats["prop_EVI_ge05"], bins=np.linspace(0,1,21), edgecolor="black", alpha=0.7)
+plt.xlabel("Proportion of EVI ≥ 0.4")
+plt.ylabel("Number of cities")
+plt.title("High-Greenness Area Fraction")
+
+plt.subplot(1,3,3)
+plt.scatter(city_stats["mean_EVI"], city_stats["prop_EVI_ge05"], alpha=0.7)
+plt.axvline(thr, color="red", linestyle="--")
+plt.axhline(0.5, color="orange", linestyle="--")
+plt.xlabel("City Mean EVI")
+plt.ylabel("Proportion EVI ≥ 0.4")
+plt.title("Greenness Level vs High-Green Fraction")
+
+plt.tight_layout()
+plt.show()
