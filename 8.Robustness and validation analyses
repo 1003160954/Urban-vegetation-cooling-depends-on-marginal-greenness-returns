@@ -1,0 +1,1637 @@
+# ============================================================
+# Experiment Pack 2: Spatial autocorrelation diagnosis (Residual Moran's I)
+# - Compare dense pixel grid vs ERA5-guided 1-pixel-per-cell sampling
+# - No need to rerun NPZ builder
+# - Outputs: CSV + boxplot figure
+# ============================================================
+
+!pip -q install rasterio tqdm scikit-learn
+
+import os, re, math, gc, json
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.enums import Resampling
+from tqdm import tqdm
+from sklearn.neighbors import NearestNeighbors
+import matplotlib.pyplot as plt
+from catboost import CatBoostRegressor
+
+# =========================
+# 0) Paths & settings
+# =========================
+ROOT = "/content/drive/MyDrive/anature_revised/data"     # city folders of GeoTIFFs
+MODEL_DIR = "/content/GZ_model_20260604_043639"          # <-- change to your model folder
+model_path = os.path.join(MODEL_DIR, "catboost_model.cbm")
+channels_path = os.path.join(MODEL_DIR, "channels.npy")
+
+assert os.path.exists(model_path), model_path
+assert os.path.exists(channels_path), channels_path
+
+# Your export grid
+FINE_DEG = 0.005
+ERA_DEG  = 0.10
+
+# For diagnostics (speed): optionally downsample within rasterio read
+SPATIAL_SUBSAMPLE = 2   # effective ~0.01 deg; set 1 if you want denser (slower)
+
+# Which months to diagnose (YYYYMM); choose 2-3 warm season months if you like
+MONTHS_TO_TEST = ["201907", "202007"]  # example; you can change
+
+# Cities to test (recommend 5 coastal + 5 inland)
+CITIES_TO_TEST = [
+    "Guangzhou", "Shanghai", "Tokyo", "NewYork", "Sydney",  # coastal examples
+    "Beijing", "Lanzhou", "Delhi", "MexicoCity", "Johannesburg"  # inland examples
+]
+
+# ERA5-guided sampling configs
+WATER_CODE = 17
+WATER_FRAC_THR = 0.7
+REQUIRE_LAND_PIXEL = True
+
+# Moran's I config (kNN weights)
+KNN_K = 8             # neighbors
+MAX_N_DENSE = 15000   # dense grid will be sub-sampled to keep speed
+N_PERM = 199          # permutation tests; 199~499 is usually enough for rebuttal
+
+# Output
+OUT_DIR = "/content/spatial_autocorr_pack2"
+os.makedirs(OUT_DIR, exist_ok=True)
+OUT_CSV = os.path.join(OUT_DIR, "pack2_moranI_results.csv")
+OUT_PNG = os.path.join(OUT_DIR, "pack2_moranI_boxplot.png")
+
+
+# =========================
+# 1) Load model & features
+# =========================
+model = CatBoostRegressor()
+model.load_model(model_path)
+
+model_channels = np.load(channels_path, allow_pickle=True).astype(object).tolist()
+# model_channels are feature names USED by model training (already dropped LST*, etc.)
+print("Model feature count:", len(model_channels))
+print("First 10 model features:", model_channels[:10])
+
+
+# =========================
+# 2) Helpers: read city GeoTIFFs -> monthly feature stack
+# =========================
+ALLOW_EXT = {".tif", ".tiff"}
+DATE8  = re.compile(r"(?:^|_)(\d{8})(?:_|$)")
+SUBVAR = re.compile(r"^[A-Za-z0-9]+")
+NTL_KEYS = {"NTL","VIIRS","NIGHT","NIGHTLIGHT"}
+
+def list_city_files(city):
+    cdir = os.path.join(ROOT, city)
+    files = [f for f in sorted(os.listdir(cdir))
+             if os.path.isfile(os.path.join(cdir,f)) and os.path.splitext(f)[1].lower() in ALLOW_EXT]
+    return cdir, files
+
+def infer_var_from_filename(filename, city):
+    base = re.sub(rf"^{re.escape(city)}_", "", filename, flags=re.IGNORECASE)
+    return base.split("_")[0].upper()
+
+def yyyymm_from_yyyymmdd(d8):
+    return d8[:6] if (d8 and len(d8)==8) else None
+
+def parse_band_desc(desc, major_var):
+    subvar, mkey = None, "STATIC"
+    if desc:
+        m_date = DATE8.search(desc)
+        if m_date:
+            mm = yyyymm_from_yyyymmdd(m_date.group(1))
+            mkey = mm if mm else "STATIC"
+        m_sv = SUBVAR.search(desc)
+        if m_sv:
+            subvar = m_sv.group(0).upper()
+    if subvar is None:
+        subvar = major_var
+    return f"{major_var}.{subvar}", mkey  # e.g., ERA5LMAIN.VPD, 201907/STATIC
+
+def get_band_descs(ds):
+    descs = list(ds.descriptions) if ds.descriptions and any(ds.descriptions) else [None]*ds.count
+    if len(descs)!=ds.count:
+        descs = (descs + [None]*ds.count)[:ds.count]
+    return descs
+
+def out_hw(h,w,s):
+    return math.ceil(h/s), math.ceil(w/s)
+
+def is_categorical_channel(chname: str) -> bool:
+    up = chname.upper()
+    return up.startswith("LC") or ".LC" in up or "MODIS.LC" in up
+
+def read_downsample(ds, b, oh, ow, resampling):
+    arr = ds.read(b, masked=True, out_shape=(oh,ow), resampling=resampling).astype(np.float32)
+    if np.ma.isMaskedArray(arr):
+        arr = arr.filled(np.nan)
+    return arr
+
+def choose_target_channel(channels):
+    # try common names; adapt if your band naming differs
+    prefs = ("LST.LSTD", "LST.LST_DAY", "LST_DAY")
+    for pref in prefs:
+        for ch in channels:
+            if ch.upper().endswith(pref.upper()):
+                return ch
+    for ch in channels:
+        if "LST" in ch.upper() and "LSTN" not in ch.upper():
+            return ch
+    for ch in channels:
+        if "LST" in ch.upper():
+            return ch
+    return None
+
+def find_ntl_channel(channels):
+    for ch in channels:
+        if any(k in ch.upper() for k in NTL_KEYS):
+            return ch
+    return None
+
+def build_ntl_core_mask(ntl_img, pct_brightest=90, ntl_min_abs=0.0):
+    m = np.isfinite(ntl_img)
+    if not m.any():
+        return np.ones_like(ntl_img, dtype=bool)
+    vals = ntl_img[m]
+    q = np.nanpercentile(vals, 100 - pct_brightest)  # keep top pct
+    return m & (ntl_img >= max(q, ntl_min_abs))
+
+def infer_water_mask_from_lc(channels, ch2i, slab0):
+    lc_candidates = [c for c in channels if c.upper().startswith("LC") or "MODIS.LC" in c.upper()]
+    if not lc_candidates:
+        return None
+    lc_ch  = lc_candidates[0]
+    lc_idx = ch2i[lc_ch]
+    lc_img = slab0[..., lc_idx]
+    lc_round = np.rint(lc_img).astype(np.float32)
+    water_mask = np.isfinite(lc_round) & (lc_round == float(WATER_CODE))
+    return water_mask
+
+def era5_block_size(fine_deg, era_deg, spatial_subsample):
+    eff_deg = fine_deg * spatial_subsample
+    blk = int(round(era_deg / eff_deg))
+    return max(1, blk)
+
+def era5_guided_one_pixel_per_block_waterdrop(valid_mask_2d, block, rng,
+                                              water_mask_2d=None,
+                                              water_frac_thr=0.7,
+                                              require_land_pixel=True):
+    H, W = valid_mask_2d.shape
+    Hb = H // block
+    Wb = W // block
+    if Hb == 0 or Wb == 0:
+        return np.array([], dtype=np.int64), {"blocks_total": 0, "blocks_used": 0, "blocks_drop_water": 0}
+
+    Ht, Wt = Hb * block, Wb * block
+    valid_trim = valid_mask_2d[:Ht, :Wt]
+    valid_blk = valid_trim.reshape(Hb, block, Wb, block).transpose(0,2,1,3)
+    valid_count = valid_blk.sum(axis=(2,3)).astype(np.int32)
+
+    blocks_total = Hb * Wb
+    usable = valid_count > 0
+    blocks_drop_water = 0
+
+    if water_mask_2d is not None:
+        water_trim = water_mask_2d[:Ht, :Wt]
+        water_blk = water_trim.reshape(Hb, block, Wb, block).transpose(0,2,1,3)
+        water_in_valid = (water_blk & valid_blk).sum(axis=(2,3)).astype(np.int32)
+        water_frac = water_in_valid / np.maximum(valid_count, 1)
+        drop_water = (water_frac > water_frac_thr) & usable
+        blocks_drop_water = int(drop_water.sum())
+        usable = usable & (~drop_water)
+        land_blk = valid_blk & (~water_blk)
+    else:
+        land_blk = valid_blk
+
+    block_indices = np.argwhere(usable)
+    chosen = np.empty((block_indices.shape[0],), dtype=np.int64)
+    keep_n = 0
+
+    for bi, bj in block_indices:
+        if water_mask_2d is not None and require_land_pixel:
+            sub = land_blk[bi, bj]
+            rr, cc = np.where(sub)
+            if rr.size == 0:
+                sub2 = valid_blk[bi, bj]
+                rr, cc = np.where(sub2)
+        else:
+            sub2 = valid_blk[bi, bj]
+            rr, cc = np.where(sub2)
+
+        if rr.size == 0:
+            continue
+        k = rng.integers(0, rr.size)
+        r = bi * block + rr[k]
+        c = bj * block + cc[k]
+        chosen[keep_n] = r * W + c
+        keep_n += 1
+
+    stats = {"blocks_total": int(blocks_total), "blocks_used": int(keep_n), "blocks_drop_water": int(blocks_drop_water)}
+    return chosen[:keep_n], stats
+
+def build_city_month_slab(city, yyyymm, spatial_subsample=2):
+    """
+    Build a (H2,W2,C) slab for a given city and YYYYMM by reading all GeoTIFF files and aggregating bands.
+    Returns: slab, channels_all, target_ch, meta (H2,W2,transform info from first file)
+    """
+    cdir, files = list_city_files(city)
+    assert files, f"No tif in {cdir}"
+
+    example_shape = None
+    index_per_file = []
+    all_channels = set()
+
+    # scan structure
+    for fn in files:
+        path = os.path.join(cdir, fn)
+        major = infer_var_from_filename(fn, city)
+        with rasterio.open(path) as ds:
+            if example_shape is None:
+                example_shape = (ds.height, ds.width)
+                first_transform = ds.transform
+            else:
+                if (ds.height, ds.width) != example_shape:
+                    continue
+            descs = get_band_descs(ds)
+            triples = []
+            for b in range(1, ds.count+1):
+                ch, mk = parse_band_desc(descs[b-1], major)
+                if mk == yyyymm or mk == "STATIC":
+                    all_channels.add(ch)
+                    triples.append((b, mk, ch))
+            if triples:
+                index_per_file.append((path, triples))
+
+    channels = sorted(all_channels)
+    ch2i = {c:i for i,c in enumerate(channels)}
+
+    H,W = example_shape
+    H2,W2 = out_hw(H,W,spatial_subsample)
+    C = len(channels)
+
+    # prepare SUM/CNT for that month, plus static cache
+    slab = np.full((H2,W2,C), np.nan, np.float32)
+    SUM = np.zeros((H2,W2,C), np.float32)
+    CNT = np.zeros((H2,W2,C), np.uint16)
+    static_cache = {}
+
+    def add_sumcnt(c_idx, arr2d):
+        m = np.isfinite(arr2d)
+        if m.any():
+            SUM[:arr2d.shape[0], :arr2d.shape[1], c_idx][m] += arr2d[m]
+            CNT[:arr2d.shape[0], :arr2d.shape[1], c_idx][m] += 1
+
+    # read
+    for path, triples in index_per_file:
+        with rasterio.open(path) as ds:
+            oh, ow = out_hw(ds.height, ds.width, spatial_subsample)
+            # bucket by (mk,ch)
+            per_bucket = {}
+            for b, mk, ch in triples:
+                per_bucket.setdefault((mk,ch), []).append(b)
+
+            for (mk,ch), band_list in per_bucket.items():
+                c_idx = ch2i[ch]
+                resamp = Resampling.nearest if is_categorical_channel(ch) else Resampling.average
+                band_list = sorted(band_list)
+                data = ds.read(indexes=band_list, masked=True,
+                               out_shape=(len(band_list), oh, ow),
+                               resampling=resamp).astype(np.float32)
+                if np.ma.isMaskedArray(data):
+                    data = data.filled(np.nan)
+
+                if is_categorical_channel(ch):
+                    arr = np.rint(data[0]).astype(np.float32)
+                else:
+                    arr = np.nanmean(data, axis=0).astype(np.float32)
+
+                if mk == "STATIC":
+                    # cache static (fill missing only for categorical, average for continuous if multiple)
+                    if c_idx not in static_cache:
+                        static_cache[c_idx] = arr
+                    else:
+                        acc = static_cache[c_idx]
+                        if is_categorical_channel(ch):
+                            m1 = np.isfinite(acc); m2 = np.isfinite(arr)
+                            acc[~m1 & m2] = arr[~m1 & m2]
+                            static_cache[c_idx] = acc
+                        else:
+                            m1 = np.isfinite(acc); m2 = np.isfinite(arr); both = m1 & m2
+                            acc[~m1 & m2] = arr[~m1 & m2]
+                            acc[both] = (acc[both] + arr[both]) / 2.0
+                            static_cache[c_idx] = acc
+                else:
+                    add_sumcnt(c_idx, arr)
+
+    # finalize month slab
+    valid = CNT > 0
+    slab[valid] = (SUM[valid] / CNT[valid]).astype(np.float32)
+    for c_idx, arr in static_cache.items():
+        slab[:arr.shape[0], :arr.shape[1], c_idx] = arr
+
+    target_ch = choose_target_channel(channels)
+    meta = {"H2":H2, "W2":W2, "transform": first_transform, "spatial_subsample": spatial_subsample}
+    return slab, channels, target_ch, meta
+
+
+# =========================
+# 3) Moran's I (kNN weights) + permutation p-value
+# =========================
+def morans_I_knn(z, xy, k=8, n_perm=199, seed=42):
+    """
+    z: (N,) residuals
+    xy: (N,2) coordinates (in meters/deg, consistent)
+    build kNN weights (row-standardized), compute Moran's I with permutation test.
+    """
+    rng = np.random.default_rng(seed)
+    z = np.asarray(z, dtype=float)
+    z = z - np.mean(z)
+    N = z.size
+    if N < (k+2):
+        return np.nan, np.nan
+
+    nn = NearestNeighbors(n_neighbors=k+1, algorithm="auto").fit(xy)
+    dist, idx = nn.kneighbors(xy)  # first neighbor is itself
+    neigh = idx[:, 1:]  # (N,k)
+
+    # weights: w_ij = 1/k (row-standardized)
+    w = 1.0 / k
+    # numerator: sum_i sum_j w_ij z_i z_j
+    num = 0.0
+    for i in range(N):
+        num += z[i] * np.sum(z[neigh[i]]) * w
+    den = np.sum(z**2)
+    W = N  # since row-standardized, sum weights per row=1 => total W = N
+
+    I = (N / W) * (num / den)
+
+    # permutation test (two-sided via |I|)
+    I_perm = np.zeros((n_perm,), dtype=float)
+    for p in range(n_perm):
+        zp = rng.permutation(z)
+        nump = 0.0
+        for i in range(N):
+            nump += zp[i] * np.sum(zp[neigh[i]]) * w
+        I_perm[p] = (N / W) * (nump / den)
+
+    p_two = (np.sum(np.abs(I_perm) >= np.abs(I)) + 1) / (n_perm + 1)
+    return float(I), float(p_two)
+
+
+# =========================
+# 4) Run diagnostics
+# =========================
+def xy_from_rc(rows, cols, meta):
+    # use pixel indices as coordinates (consistent for Moran with kNN); scale by effective resolution
+    # You can also convert to lon/lat with transform, but index-space is fine for spatial autocorr.
+    s = meta["spatial_subsample"]
+    return np.stack([cols * s, rows * s], axis=1).astype(np.float32)
+
+records = []
+rng = np.random.default_rng(42)
+
+for city in CITIES_TO_TEST:
+    for mm in MONTHS_TO_TEST:
+        try:
+            slab, ch_all, target_ch, meta = build_city_month_slab(city, mm, SPATIAL_SUBSAMPLE)
+        except Exception as e:
+            print(f"[SKIP] {city} {mm}: {repr(e)}")
+            continue
+
+        if target_ch is None:
+            print(f"[SKIP] {city} {mm}: no target LST channel detected")
+            continue
+
+        ch2i = {c:i for i,c in enumerate(ch_all)}
+        y_idx = ch2i[target_ch]
+
+        # Build feature matrix aligned to model_channels
+        # For any missing feature (shouldn't happen often), skip this city-month
+        miss = [f for f in model_channels if f not in ch2i]
+        if miss:
+            print(f"[SKIP] {city} {mm}: missing features {miss[:5]}...")
+            continue
+
+        feat_idx = [ch2i[f] for f in model_channels]
+
+        y = slab[..., y_idx].reshape(-1)
+        X = slab[..., feat_idx].reshape(-1, len(feat_idx))
+
+        # Urban core mask (NTL brightest 90%) for fair comparison
+        ntl_ch = find_ntl_channel(ch_all)
+        if ntl_ch is not None:
+            ntl = slab[..., ch2i[ntl_ch]]
+            core = build_ntl_core_mask(ntl, pct_brightest=90, ntl_min_abs=0.0).reshape(-1)
+        else:
+            core = np.isfinite(y)
+
+        valid = core & np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+        if valid.sum() < 500:
+            print(f"[SKIP] {city} {mm}: too few valid pixels ({valid.sum()})")
+            continue
+
+        # Prediction residuals on dense pixels
+        Xv = X[valid]
+        yv = y[valid]
+        pred = model.predict(Xv)
+        resid = (yv - pred).astype(np.float32)
+
+        # dense: subsample for speed
+        vidx = np.flatnonzero(valid)
+        if resid.size > MAX_N_DENSE:
+            pick = rng.choice(resid.size, size=MAX_N_DENSE, replace=False)
+            resid_dense = resid[pick]
+            vidx_dense = vidx[pick]
+        else:
+            resid_dense = resid
+            vidx_dense = vidx
+
+        rows_dense = (vidx_dense // meta["W2"]).astype(np.int32)
+        cols_dense = (vidx_dense %  meta["W2"]).astype(np.int32)
+        xy_dense = xy_from_rc(rows_dense, cols_dense, meta)
+
+        I_dense, p_dense = morans_I_knn(resid_dense, xy_dense, k=KNN_K, n_perm=N_PERM, seed=42)
+
+        records.append({
+            "city": city, "month": mm, "scheme": "dense",
+            "N": int(resid_dense.size), "MoranI": I_dense, "p_perm": p_dense
+        })
+
+        # ERA5-guided: one pixel per ERA5 block, drop water-dominated blocks
+        # water mask from LC if exists
+        water_mask2d = infer_water_mask_from_lc(ch_all, ch2i, slab)
+        core2d = core.reshape(meta["H2"], meta["W2"])
+        valid2d = valid.reshape(meta["H2"], meta["W2"])
+
+        block = era5_block_size(FINE_DEG, ERA_DEG, SPATIAL_SUBSAMPLE)
+        pix_idx, stats_blk = era5_guided_one_pixel_per_block_waterdrop(
+            valid_mask_2d=valid2d & core2d,
+            block=block,
+            rng=rng,
+            water_mask_2d=water_mask2d,
+            water_frac_thr=WATER_FRAC_THR,
+            require_land_pixel=REQUIRE_LAND_PIXEL
+        )
+
+        if pix_idx.size < 80:
+            print(f"[WARN] {city} {mm}: too few ERA5-guided samples ({pix_idx.size})")
+            continue
+
+        Xb = X[pix_idx]
+        yb = y[pix_idx]
+        pred_b = model.predict(Xb)
+        resid_b = (yb - pred_b).astype(np.float32)
+
+        rows_b = (pix_idx // meta["W2"]).astype(np.int32)
+        cols_b = (pix_idx %  meta["W2"]).astype(np.int32)
+        xy_b = xy_from_rc(rows_b, cols_b, meta)
+
+        I_b, p_b = morans_I_knn(resid_b, xy_b, k=min(KNN_K, max(3, pix_idx.size-2)), n_perm=N_PERM, seed=42)
+
+        records.append({
+            "city": city, "month": mm, "scheme": "era5_1ppc",
+            "N": int(resid_b.size), "MoranI": I_b, "p_perm": p_b,
+            "block": block, "blocks_total": stats_blk["blocks_total"],
+            "blocks_used": stats_blk["blocks_used"], "blocks_drop_water": stats_blk["blocks_drop_water"]
+        })
+
+        print(f"[OK] {city} {mm}  dense(I={I_dense:.3f},p={p_dense:.3f},N={resid_dense.size})"
+              f"  vs  era5(I={I_b:.3f},p={p_b:.3f},N={resid_b.size},dropW={stats_blk['blocks_drop_water']})")
+
+df = pd.DataFrame(records)
+df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+print("Saved:", OUT_CSV)
+
+# =========================
+# 5) Plot summary
+# =========================
+if not df.empty:
+    plt.figure(figsize=(9,4.5))
+    schemes = ["dense", "era5_1ppc"]
+    data = [df.loc[df["scheme"]==s, "MoranI"].dropna().values for s in schemes]
+    plt.boxplot(data, labels=schemes, showmeans=True)
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.ylabel("Residual Moran's I (kNN weights)")
+    plt.title("Spatial autocorrelation of residuals: dense vs ERA5-guided sampling")
+    plt.tight_layout()
+    plt.savefig(OUT_PNG, dpi=180)
+    plt.show()
+    print("Saved:", OUT_PNG)
+
+df
+# ============================================================
+# Experiment Pack 4 revised
+# 1) Correlation structure
+# 2) Drop-group test: retrain without EVI+LAI
+# 3) Naive vs conditional permutation importance
+# City-group holdout uses sample_city_id metadata, not META.CITY_ID in X
+# ============================================================
+
+# !pip -q install catboost
+
+import os, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from catboost import CatBoostRegressor, Pool
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.linear_model import Ridge
+
+
+# ---------------------------
+# 0) CONFIG
+# ---------------------------
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+OUT_DIR  = "/content/exp_pack4_steps1_3_revised"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+TEST_CITY_FRAC = 0.20
+
+EVI_NAME = "EVI.EVI"
+LAI_NAME = "LAI.LAI"
+CITY_COL = "__city_id__"
+
+DROP_MAIN = {
+    "ERA5LMAIN.T2M",
+    "ERA5LMAIN.TD",
+    "ERA5LMAIN.STL1",
+    "META.CITY_ID",
+}
+
+CAT_PARAMS = dict(
+    iterations=6000,
+    depth=8,
+    learning_rate=0.05,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=200,
+    verbose=200,
+)
+
+USE_GPU_TRY = True
+
+
+# ---------------------------
+# 1) LOAD NPZ
+# ---------------------------
+npz = np.load(NPZ_PATH, allow_pickle=True)
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels = npz["channels"].astype(object).tolist()
+
+if "sample_city_id" not in npz.files:
+    raise RuntimeError("NPZ missing sample_city_id metadata. Cannot do city-group holdout.")
+
+df = pd.DataFrame(X_raw, columns=channels)
+df["__y__"] = y_raw
+df[CITY_COL] = npz["sample_city_id"].astype(int)
+
+df = df[np.isfinite(df["__y__"])].copy()
+
+print("Loaded df:", df.shape)
+print("n cities:", df[CITY_COL].nunique())
+print("channels:", channels)
+print("Has EVI?", EVI_NAME in df.columns, "| Has LAI?", LAI_NAME in df.columns)
+
+
+# ---------------------------
+# 2) HELPERS
+# ---------------------------
+def split_by_city(df, city_col=CITY_COL, test_frac=0.2, seed=42):
+    rng = np.random.default_rng(seed)
+    cities = np.array(sorted(df[city_col].unique()))
+    n_test = max(1, int(round(test_frac * len(cities))))
+    test_cities = set(rng.choice(cities, size=n_test, replace=False).tolist())
+    tr = df[~df[city_col].isin(test_cities)].copy()
+    te = df[df[city_col].isin(test_cities)].copy()
+    return tr, te, sorted(list(test_cities))
+
+
+def evaluate(pred, y_true):
+    rmse = float(mean_squared_error(y_true, pred) ** 0.5)
+    mae = float(mean_absolute_error(y_true, pred))
+    r2 = float(r2_score(y_true, pred))
+    return dict(rmse=rmse, mae=mae, r2=r2)
+
+
+def build_Xy(df, drop_cols=(), y_col="__y__", city_col=CITY_COL):
+    drop_cols = set(drop_cols) | set(DROP_MAIN)
+
+    cols = [
+        c for c in df.columns
+        if c not in [y_col, city_col]
+        and not c.upper().startswith("LST.")
+        and "LST" not in c.upper()
+        and c not in drop_cols
+    ]
+
+    X = df[cols].to_numpy(np.float32)
+    y = df[y_col].to_numpy(np.float32)
+    return X, y, cols
+
+
+def fit_catboost(X_tr, y_tr, X_te, y_te, feature_names, params, try_gpu=True):
+    train_pool = Pool(X_tr, y_tr, feature_names=feature_names)
+    test_pool = Pool(X_te, y_te, feature_names=feature_names)
+
+    if try_gpu:
+        try:
+            model = CatBoostRegressor(**params, task_type="GPU", devices="0")
+            model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+            return model, True
+        except Exception as e:
+            print("[GPU fallback]", repr(e))
+
+    model = CatBoostRegressor(**params)
+    model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+    return model, False
+
+
+def rmse(y, p):
+    return float(mean_squared_error(y, p) ** 0.5)
+
+
+# ============================================================
+# STEP 1) Correlation structure
+# ============================================================
+feature_cols = [
+    c for c in df.columns
+    if c not in ["__y__", CITY_COL]
+    and not c.upper().startswith("LST.")
+    and "LST" not in c.upper()
+    and c not in DROP_MAIN
+]
+
+df_feat = df[feature_cols].copy()
+
+pear = df_feat.corr(method="pearson")
+spear = df_feat.corr(method="spearman")
+
+pear.to_csv(os.path.join(OUT_DIR, "corr_pearson.csv"))
+spear.to_csv(os.path.join(OUT_DIR, "corr_spearman.csv"))
+
+print("[Step1] Feature cols:", feature_cols)
+print("[Step1] Saved correlation matrices.")
+
+def plot_corr(mat, title, out_png):
+    plt.figure(figsize=(9, 7))
+    plt.imshow(mat.values, aspect="auto")
+    plt.colorbar()
+    plt.xticks(range(len(mat.columns)), mat.columns, rotation=90)
+    plt.yticks(range(len(mat.index)), mat.index)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=300)
+    plt.show()
+
+plot_corr(pear, "Global Pearson correlation", os.path.join(OUT_DIR, "corr_pearson.png"))
+plot_corr(spear, "Global Spearman correlation", os.path.join(OUT_DIR, "corr_spearman.png"))
+
+city_corr_records = []
+if EVI_NAME in df.columns and LAI_NAME in df.columns:
+    for cid, sub in df[[CITY_COL, EVI_NAME, LAI_NAME]].groupby(CITY_COL):
+        a = sub[EVI_NAME].to_numpy()
+        b = sub[LAI_NAME].to_numpy()
+        m = np.isfinite(a) & np.isfinite(b)
+        if m.sum() < 30:
+            continue
+        city_corr_records.append({
+            "city_id": int(cid),
+            "n": int(m.sum()),
+            "pearson": float(pd.Series(a[m]).corr(pd.Series(b[m]), method="pearson")),
+            "spearman": float(pd.Series(a[m]).corr(pd.Series(b[m]), method="spearman")),
+        })
+
+df_citycorr = pd.DataFrame(city_corr_records).sort_values("city_id")
+df_citycorr.to_csv(os.path.join(OUT_DIR, "citywise_EVI_LAI_corr.csv"), index=False)
+
+plt.figure(figsize=(7, 4))
+plt.hist(df_citycorr["spearman"].values, bins=30)
+plt.title("Per-city Spearman corr(EVI, LAI)")
+plt.xlabel("Spearman ρ")
+plt.ylabel("Count of cities")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "hist_citywise_spearman_EVI_LAI.png"), dpi=300)
+plt.show()
+
+
+# ============================================================
+# STEP 2) Drop-group test: baseline vs without EVI+LAI
+# ============================================================
+train_df, test_df, test_cities = split_by_city(
+    df, test_frac=TEST_CITY_FRAC, seed=RANDOM_SEED
+)
+
+print(f"[Split] train={train_df.shape}, test={test_df.shape}, test_cities={len(test_cities)}")
+
+X_tr, y_tr, feat_names = build_Xy(train_df)
+X_te, y_te, _ = build_Xy(test_df)
+
+print("[Step2] baseline features:", feat_names)
+
+baseline_model, used_gpu = fit_catboost(
+    X_tr, y_tr, X_te, y_te, feat_names, CAT_PARAMS, try_gpu=USE_GPU_TRY
+)
+
+pred_base = baseline_model.predict(X_te)
+met_base = evaluate(pred_base, y_te)
+
+drop_group = [c for c in [EVI_NAME, LAI_NAME] if c in feat_names]
+
+X_tr_d, y_tr_d, feat_names_d = build_Xy(train_df, drop_cols=drop_group)
+X_te_d, y_te_d, _ = build_Xy(test_df, drop_cols=drop_group)
+
+print("[Step2] drop-group features:", feat_names_d)
+print("[Step2] dropped:", drop_group)
+
+drop_model, used_gpu2 = fit_catboost(
+    X_tr_d, y_tr_d, X_te_d, y_te_d, feat_names_d, CAT_PARAMS, try_gpu=USE_GPU_TRY
+)
+
+pred_drop = drop_model.predict(X_te_d)
+met_drop = evaluate(pred_drop, y_te_d)
+
+step2_out = {
+    "npz_path": NPZ_PATH,
+    "test_city_frac": TEST_CITY_FRAC,
+    "n_test_cities": len(test_cities),
+    "test_city_ids_first20": test_cities[:20],
+    "baseline": {
+        "features": feat_names,
+        "n_features": len(feat_names),
+        "metrics": met_base,
+        "used_gpu": used_gpu,
+    },
+    "drop_group": {
+        "dropped": drop_group,
+        "features": feat_names_d,
+        "n_features": len(feat_names_d),
+        "metrics": met_drop,
+        "used_gpu": used_gpu2,
+    },
+    "delta": {
+        "rmse_increase": float(met_drop["rmse"] - met_base["rmse"]),
+        "mae_increase": float(met_drop["mae"] - met_base["mae"]),
+        "r2_decrease": float(met_base["r2"] - met_drop["r2"]),
+    }
+}
+
+with open(os.path.join(OUT_DIR, "step2_drop_group_summary.json"), "w") as f:
+    json.dump(step2_out, f, indent=2)
+
+print("[Step2][Baseline]", met_base)
+print("[Step2][Drop EVI+LAI]", met_drop)
+print("[Step2][Delta]", step2_out["delta"])
+
+
+# ============================================================
+# STEP 3) Permutation importance
+# ============================================================
+X_test = pd.DataFrame(X_te, columns=feat_names)
+X_train = pd.DataFrame(X_tr, columns=feat_names)
+y_test = y_te.copy()
+rmse0 = met_base["rmse"]
+
+def naive_perm_delta_rmse(model, X_df, y, col, seed=42, n_repeats=5):
+    if col not in X_df.columns:
+        return None
+
+    rng = np.random.default_rng(seed)
+    deltas = []
+
+    for _ in range(n_repeats):
+        Xp = X_df.copy()
+        Xp[col] = rng.permutation(Xp[col].values)
+        pred = model.predict(Xp.to_numpy(np.float32))
+        deltas.append(rmse(y, pred) - rmse0)
+
+    return {
+        "mean": float(np.mean(deltas)),
+        "std": float(np.std(deltas)),
+        "repeats": n_repeats,
+    }
+
+
+def conditional_residual_perm_delta_rmse(
+    model, X_train_df, X_test_df, y_test, target_col,
+    alpha=1.0, seed=42, n_repeats=5
+):
+    if target_col not in X_test_df.columns:
+        return None
+
+    other_cols = [c for c in X_train_df.columns if c != target_col]
+
+    tr = X_train_df[[target_col] + other_cols].copy()
+    te = X_test_df[[target_col] + other_cols].copy()
+
+    mtr = np.isfinite(tr.to_numpy()).all(axis=1)
+    mte = np.isfinite(te.to_numpy()).all(axis=1)
+
+    tr = tr.loc[mtr]
+    te = te.loc[mte]
+
+    reg = Ridge(alpha=alpha)
+    reg.fit(
+        tr[other_cols].to_numpy(np.float32),
+        tr[target_col].to_numpy(np.float32)
+    )
+
+    yhat_te = reg.predict(te[other_cols].to_numpy(np.float32))
+    resid_te = te[target_col].to_numpy(np.float32) - yhat_te
+
+    rng = np.random.default_rng(seed)
+    deltas = []
+
+    for _ in range(n_repeats):
+        Xp = X_test_df.copy()
+        resid_perm = rng.permutation(resid_te)
+        Xp.loc[mte, target_col] = (yhat_te + resid_perm).astype(np.float32)
+
+        pred = model.predict(Xp.to_numpy(np.float32))
+        deltas.append(rmse(y_test, pred) - rmse0)
+
+    return {
+        "mean": float(np.mean(deltas)),
+        "std": float(np.std(deltas)),
+        "repeats": n_repeats,
+        "alpha": float(alpha),
+        "n_test_used": int(mte.sum()),
+    }
+
+
+step3 = {
+    "baseline_rmse": rmse0,
+    "naive": {},
+    "conditional_residual": {},
+}
+
+for col in [EVI_NAME, LAI_NAME]:
+    step3["naive"][col] = naive_perm_delta_rmse(
+        baseline_model, X_test, y_test, col,
+        seed=RANDOM_SEED, n_repeats=5
+    )
+
+    step3["conditional_residual"][col] = conditional_residual_perm_delta_rmse(
+        baseline_model, X_train, X_test, y_test, col,
+        alpha=1.0, seed=RANDOM_SEED, n_repeats=5
+    )
+
+print("\n[Step3] Permutation importance ΔRMSE:")
+for col in [EVI_NAME, LAI_NAME]:
+    nres = step3["naive"][col]
+    cres = step3["conditional_residual"][col]
+
+    if nres is not None:
+        print(f"{col} naive: {nres['mean']:.4f} ± {nres['std']:.4f}")
+
+    if cres is not None:
+        print(f"{col} conditional: {cres['mean']:.4f} ± {cres['std']:.4f} "
+              f"(n={cres['n_test_used']})")
+
+with open(os.path.join(OUT_DIR, "step3_perm_importance_EVI_LAI.json"), "w") as f:
+    json.dump(step3, f, indent=2)
+
+labels, naive_means, cond_means = [], [], []
+
+for col in [EVI_NAME, LAI_NAME]:
+    if step3["naive"][col] is None:
+        continue
+    labels.append(col)
+    naive_means.append(step3["naive"][col]["mean"])
+    cond_means.append(step3["conditional_residual"][col]["mean"])
+
+x = np.arange(len(labels))
+
+plt.figure(figsize=(7, 4))
+plt.bar(x - 0.15, naive_means, width=0.3, label="Naive permutation")
+plt.bar(x + 0.15, cond_means, width=0.3, label="Conditional residual permutation")
+plt.xticks(x, labels)
+plt.ylabel("ΔRMSE on city-holdout test")
+plt.title("Permutation importance: naive vs conditional")
+plt.legend()
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "step3_perm_importance_bar.png"), dpi=300)
+plt.show()
+
+print("\nDone. Outputs saved to:", OUT_DIR)
+print("Files:", sorted(os.listdir(OUT_DIR))[:30])
+
+# ============================================================
+# CV-SHAP — City-GroupKFold
+# Uses sample_city_id metadata, not META.CITY_ID in X
+# ============================================================
+
+# !pip -q install catboost
+
+import os, json, math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from itertools import combinations
+from datetime import datetime
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+
+# --------------------------
+# 0) CONFIG
+# --------------------------
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+OUT_DIR = "/content/cv_shap_results_final"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+N_SPLITS = 5
+
+DROP_LIST = {
+    "ERA5LMAIN.STL1",
+    "ERA5LMAIN.T2M",
+    "ERA5LMAIN.TD",
+    "META.CITY_ID",
+}
+
+SHAP_MAX_SAMPLES_PER_FOLD = 120_000
+SHAP_TOPK = 20
+
+CB_PARAMS_GPU = dict(
+    iterations=8000,
+    depth=8,
+    learning_rate=0.08,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    task_type="GPU",
+    devices="0",
+    od_type="Iter",
+    od_wait=200,
+    verbose=200,
+)
+
+CB_PARAMS_CPU = dict(
+    iterations=3000,
+    depth=8,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=200,
+    verbose=200,
+)
+
+
+# --------------------------
+# 1) LOAD DATA
+# --------------------------
+npz = np.load(NPZ_PATH, allow_pickle=True)
+
+X_raw = npz["X"].astype(np.float32)
+y_raw = npz["y"].astype(np.float32)
+channels_raw = npz["channels"].astype(object).tolist()
+
+if "sample_city_id" not in npz.files:
+    raise RuntimeError("NPZ missing sample_city_id. Cannot run City-GroupKFold.")
+
+groups_raw = npz["sample_city_id"].astype(np.int32)
+
+mask = np.isfinite(y_raw)
+X_raw = X_raw[mask]
+y = y_raw[mask]
+groups_city = groups_raw[mask]
+
+keep_idx = []
+dropped = []
+
+for i, ch in enumerate(channels_raw):
+    ch_upper = str(ch).upper()
+
+    if ch in DROP_LIST:
+        dropped.append(ch)
+    elif ch_upper.startswith("LST.") or "LST" in ch_upper:
+        dropped.append(ch)
+    else:
+        keep_idx.append(i)
+
+X = X_raw[:, keep_idx]
+features = [channels_raw[i] for i in keep_idx]
+
+print("Loaded:")
+print("X:", X.shape)
+print("y:", y.shape)
+print("n cities:", len(np.unique(groups_city)))
+print("features:", features)
+print("dropped:", dropped)
+
+assert "META.CITY_ID" not in features
+assert "ERA5LMAIN.T2M" not in features
+assert "ERA5LMAIN.TD" not in features
+assert "ERA5LMAIN.STL1" not in features
+
+
+# --------------------------
+# 2) HELPERS
+# --------------------------
+def eval_metrics(y_true, y_pred):
+    return {
+        "rmse": float(mean_squared_error(y_true, y_pred) ** 0.5),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "r2": float(r2_score(y_true, y_pred)),
+    }
+
+
+def train_catboost(X_tr, y_tr, X_te, y_te, feature_names):
+    train_pool = Pool(X_tr, y_tr, feature_names=feature_names)
+    test_pool = Pool(X_te, y_te, feature_names=feature_names)
+
+    try:
+        model = CatBoostRegressor(**CB_PARAMS_GPU)
+        model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+        return model, True
+
+    except Exception as e:
+        print("[GPU fallback]", repr(e))
+        model = CatBoostRegressor(**CB_PARAMS_CPU)
+        model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+        return model, False
+
+
+def shap_mean_abs(model, X_te, feature_names, max_samples=120_000, seed=42):
+    n = X_te.shape[0]
+    rng = np.random.default_rng(seed)
+
+    if n > max_samples:
+        idx = rng.choice(n, size=max_samples, replace=False)
+        Xs = X_te[idx]
+    else:
+        Xs = X_te
+
+    pool = Pool(Xs, feature_names=feature_names)
+    shap = model.get_feature_importance(pool, type="ShapValues")
+    shap = np.asarray(shap)[:, :-1]
+
+    return np.mean(np.abs(shap), axis=0), Xs.shape[0]
+
+
+def rank_desc(v):
+    order = np.argsort(-v)
+    ranks = np.empty_like(order)
+    ranks[order] = np.arange(1, len(v) + 1)
+    return ranks
+
+
+def spearman_from_values(a, b):
+    ra = rank_desc(a).astype(float)
+    rb = rank_desc(b).astype(float)
+
+    ra -= ra.mean()
+    rb -= rb.mean()
+
+    den = np.sqrt(np.sum(ra ** 2) * np.sum(rb ** 2))
+    return float(np.sum(ra * rb) / den) if den > 0 else np.nan
+
+
+# --------------------------
+# 3) CV LOOP
+# --------------------------
+gkf = GroupKFold(n_splits=N_SPLITS)
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_dir = os.path.join(OUT_DIR, f"cv_shap_city_{stamp}")
+os.makedirs(run_dir, exist_ok=True)
+
+fold_metrics = []
+fold_shap = []
+fold_topk = []
+
+print("Run dir:", run_dir)
+
+for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups=groups_city), start=1):
+    X_tr, y_tr = X[tr_idx], y[tr_idx]
+    X_te, y_te = X[te_idx], y[te_idx]
+
+    train_groups = len(np.unique(groups_city[tr_idx]))
+    test_groups = len(np.unique(groups_city[te_idx]))
+
+    print(f"\n[Fold {fold}] train={X_tr.shape}, test={X_te.shape}, groups={train_groups}/{test_groups}")
+
+    model, used_gpu = train_catboost(X_tr, y_tr, X_te, y_te, features)
+
+    pred = model.predict(X_te)
+    met = eval_metrics(y_te, pred)
+
+    met.update({
+        "fold": fold,
+        "n_train": int(X_tr.shape[0]),
+        "n_test": int(X_te.shape[0]),
+        "train_groups": int(train_groups),
+        "test_groups": int(test_groups),
+        "used_gpu": bool(used_gpu),
+    })
+
+    fold_metrics.append(met)
+
+    print(f"RMSE={met['rmse']:.3f}, MAE={met['mae']:.3f}, R2={met['r2']:.3f}, GPU={used_gpu}")
+
+    mean_abs, n_used = shap_mean_abs(
+        model,
+        X_te,
+        features,
+        max_samples=SHAP_MAX_SAMPLES_PER_FOLD,
+        seed=RANDOM_SEED + fold,
+    )
+
+    fold_shap.append(mean_abs)
+
+    top_idx = np.argsort(-mean_abs)[:SHAP_TOPK]
+    top_names = [features[i] for i in top_idx]
+    fold_topk.append(top_names)
+
+    print(f"SHAP n={n_used:,}, Top1={top_names[0]}")
+
+    np.save(os.path.join(run_dir, f"fold{fold:02d}_shap_meanabs.npy"), mean_abs)
+
+    with open(os.path.join(run_dir, f"fold{fold:02d}_top{SHAP_TOPK}.json"), "w") as f:
+        json.dump({"fold": fold, "top_features": top_names}, f, indent=2)
+
+
+# --------------------------
+# 4) AGGREGATE
+# --------------------------
+metrics_df = pd.DataFrame(fold_metrics)
+metrics_df.to_csv(os.path.join(run_dir, "cv_metrics.csv"), index=False)
+
+S = np.vstack(fold_shap)
+mean_imp = S.mean(axis=0)
+std_imp = S.std(axis=0, ddof=1)
+ci95 = 1.96 * std_imp / math.sqrt(N_SPLITS)
+
+topk_freq = {f: 0 for f in features}
+for top_list in fold_topk:
+    for f in top_list:
+        topk_freq[f] += 1
+
+topk_freq = {k: v / N_SPLITS for k, v in topk_freq.items()}
+
+pair_rhos = []
+for i, j in combinations(range(N_SPLITS), 2):
+    pair_rhos.append(spearman_from_values(S[i], S[j]))
+
+summary_df = pd.DataFrame({
+    "feature": features,
+    "shap_mean_abs_mean": mean_imp,
+    "shap_mean_abs_std": std_imp,
+    "shap_mean_abs_ci95": ci95,
+    "topk_freq": [topk_freq[f] for f in features],
+}).sort_values("shap_mean_abs_mean", ascending=False)
+
+summary_df.to_csv(os.path.join(run_dir, "cv_shap_summary.csv"), index=False)
+
+summary = {
+    "cv_type": "City-GroupKFold using sample_city_id metadata",
+    "n_splits": N_SPLITS,
+    "features": features,
+    "dropped": dropped,
+    "metrics_mean": {
+        "rmse": float(metrics_df["rmse"].mean()),
+        "mae": float(metrics_df["mae"].mean()),
+        "r2": float(metrics_df["r2"].mean()),
+    },
+    "metrics_std": {
+        "rmse": float(metrics_df["rmse"].std(ddof=1)),
+        "mae": float(metrics_df["mae"].std(ddof=1)),
+        "r2": float(metrics_df["r2"].std(ddof=1)),
+    },
+    "rank_stability_spearman": {
+        "pairwise_rho_mean": float(np.nanmean(pair_rhos)),
+        "pairwise_rho_std": float(np.nanstd(pair_rhos, ddof=1)),
+        "pairwise_rhos": [float(x) for x in pair_rhos],
+    },
+}
+
+with open(os.path.join(run_dir, "cv_shap_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print("\nCV-SHAP finished.")
+print("metrics mean:", summary["metrics_mean"])
+print("rank stability:", summary["rank_stability_spearman"])
+
+
+# --------------------------
+# 5) PLOT
+# --------------------------
+TOPPLOT = min(15, len(features))
+plot_df = summary_df.head(TOPPLOT).copy()
+
+ypos = np.arange(plot_df.shape[0])
+
+plt.figure(figsize=(9, 6))
+plt.barh(ypos, plot_df["shap_mean_abs_mean"].values)
+plt.errorbar(
+    plot_df["shap_mean_abs_mean"].values,
+    ypos,
+    xerr=plot_df["shap_mean_abs_ci95"].values,
+    fmt="none",
+    color="black",
+    linewidth=1,
+)
+plt.gca().invert_yaxis()
+plt.yticks(ypos, plot_df["feature"].values)
+
+for i, row in plot_df.iterrows():
+    y_i = list(plot_df.index).index(i)
+    x_i = row["shap_mean_abs_mean"] + row["shap_mean_abs_ci95"]
+    plt.text(x_i, y_i, f"  freq={row['topk_freq']:.2f}", va="center")
+
+plt.xlabel("Mean |SHAP| across city-group folds")
+plt.title(f"CV-SHAP stability, City-GroupKFold K={N_SPLITS}")
+plt.tight_layout()
+
+out_fig = os.path.join(run_dir, "cv_shap_top15_stability.png")
+plt.savefig(out_fig, dpi=300, bbox_inches="tight")
+plt.show()
+
+print("Saved to:", run_dir)
+print("Files:", sorted(os.listdir(run_dir))[:30])
+
+# ============================================================
+# City-GroupKFold perturbation robustness test
+# Uses sample_city_id metadata, not META.CITY_ID in X
+# ============================================================
+
+# !pip -q install catboost
+
+import os, json, time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+from catboost import CatBoostRegressor, Pool
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# ---------------------------
+# 0) Config
+# ---------------------------
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+OUT_DIR = "/content/exp_pack_perturb_citycv_final"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RANDOM_SEED = 42
+K = 5
+
+N_PER_FOLD = 200000
+R = 5
+SIGMA_LIST = [0.00, 0.05, 0.10, 0.20]
+
+PERTURB_FEATURES = ["EVI.EVI", "LAI.LAI"]
+
+DROP_FEATURES = {
+    "ERA5LMAIN.STL1",
+    "ERA5LMAIN.T2M",
+    "ERA5LMAIN.TD",
+    "META.CITY_ID",
+}
+
+CB_PARAMS_GPU = dict(
+    iterations=3000,
+    depth=8,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    task_type="GPU",
+    devices="0",
+    od_type="Iter",
+    od_wait=150,
+    verbose=False,
+)
+
+CB_PARAMS_CPU = dict(
+    iterations=2000,
+    depth=8,
+    learning_rate=0.05,
+    l2_leaf_reg=3.0,
+    loss_function="RMSE",
+    eval_metric="RMSE",
+    random_seed=RANDOM_SEED,
+    od_type="Iter",
+    od_wait=150,
+    verbose=False,
+)
+
+# ---------------------------
+# 1) Load NPZ
+# ---------------------------
+npz = np.load(NPZ_PATH, allow_pickle=True)
+
+X = npz["X"].astype(np.float32)
+y = npz["y"].astype(np.float32)
+channels = npz["channels"].astype(object).tolist()
+
+if "sample_city_id" not in npz.files:
+    raise RuntimeError("NPZ missing sample_city_id metadata.")
+
+city_id = npz["sample_city_id"].astype(np.int32)
+
+print(f"Loaded: X={X.shape}, y={y.shape}, n_channels={len(channels)}")
+print("Channels:", channels)
+
+m = np.isfinite(y)
+X = X[m]
+y = y[m]
+city_id = city_id[m]
+
+print(f"After y finite mask: X={X.shape}, y={y.shape}")
+print("City groups:", len(np.unique(city_id)))
+
+# ---------------------------
+# 2) Feature filtering
+# ---------------------------
+keep_idx = []
+dropped = []
+
+for i, ch in enumerate(channels):
+    ch_upper = str(ch).upper()
+
+    if ch in DROP_FEATURES:
+        dropped.append(ch)
+    elif ch_upper.startswith("LST.") or "LST" in ch_upper:
+        dropped.append(ch)
+    else:
+        keep_idx.append(i)
+
+X = X[:, keep_idx]
+channels_final = [channels[i] for i in keep_idx]
+
+print(f"Kept features={len(channels_final)}")
+print("Final features:", channels_final)
+print("Dropped:", dropped)
+
+assert "META.CITY_ID" not in channels_final
+assert "ERA5LMAIN.T2M" not in channels_final
+assert "ERA5LMAIN.TD" not in channels_final
+assert "ERA5LMAIN.STL1" not in channels_final
+
+perturb_cols = []
+missing = []
+
+for f in PERTURB_FEATURES:
+    if f in channels_final:
+        perturb_cols.append(channels_final.index(f))
+    else:
+        missing.append(f)
+
+if missing:
+    raise RuntimeError(f"Missing perturb features: {missing}")
+
+feat_std = np.nanstd(X, axis=0).astype(np.float32)
+feat_std[~np.isfinite(feat_std)] = 0.0
+feat_std[feat_std == 0] = 1.0
+
+# ---------------------------
+# 3) Helpers
+# ---------------------------
+def evaluate(y_true, y_pred):
+    rmse = float(mean_squared_error(y_true, y_pred) ** 0.5)
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    return rmse, mae, r2
+
+def train_catboost(Xtr, ytr, Xva, yva, feature_names):
+    train_pool = Pool(Xtr, ytr, feature_names=feature_names)
+    val_pool = Pool(Xva, yva, feature_names=feature_names)
+
+    try:
+        model = CatBoostRegressor(**CB_PARAMS_GPU)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        return model, True
+    except Exception as e:
+        print("[GPU fallback]", repr(e))
+        model = CatBoostRegressor(**CB_PARAMS_CPU)
+        model.fit(train_pool, eval_set=val_pool, use_best_model=True)
+        return model, False
+
+def sample_indices(rng, n, k):
+    if k <= 0 or k >= n:
+        return np.arange(n, dtype=np.int64)
+    return rng.choice(n, size=k, replace=False)
+
+def perturb_X_gaussian(Xbase, cols, sigma_rel, rng):
+    if sigma_rel <= 0:
+        return Xbase
+
+    Xp = Xbase.copy()
+
+    for c in cols:
+        s = sigma_rel * feat_std[c]
+        noise = rng.normal(0.0, s, size=Xp.shape[0]).astype(np.float32)
+        Xp[:, c] = Xp[:, c] + noise
+
+    return Xp.astype(np.float32)
+
+def mean_ci95(arr):
+    arr = np.asarray(arr, dtype=float)
+    m = float(np.mean(arr))
+
+    if arr.size <= 1:
+        return m, 0.0
+
+    se = float(np.std(arr, ddof=1) / np.sqrt(arr.size))
+    return m, 1.96 * se
+
+# ---------------------------
+# 4) City-GroupKFold perturbation experiment
+# ---------------------------
+gkf = GroupKFold(n_splits=K)
+rng = np.random.default_rng(RANDOM_SEED)
+
+rows = []
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_tag = f"perturb_citycv_{stamp}"
+t0 = time.time()
+
+for fold, (tr_idx, te_idx) in enumerate(gkf.split(X, y, groups=city_id), 1):
+    Xtr_full, ytr_full = X[tr_idx], y[tr_idx]
+    Xte_full, yte_full = X[te_idx], y[te_idx]
+
+    ntr = Xtr_full.shape[0]
+    val_n = min(200000, max(50000, int(0.1 * ntr)))
+
+    val_idx_local = sample_indices(rng, ntr, val_n)
+    tr_mask = np.ones(ntr, dtype=bool)
+    tr_mask[val_idx_local] = False
+
+    Xtr, ytr = Xtr_full[tr_mask], ytr_full[tr_mask]
+    Xva, yva = Xtr_full[val_idx_local], ytr_full[val_idx_local]
+
+    model, used_gpu = train_catboost(Xtr, ytr, Xva, yva, channels_final)
+
+    nte = Xte_full.shape[0]
+    take = min(N_PER_FOLD, nte)
+    take_idx = sample_indices(rng, nte, take)
+
+    Xte = Xte_full[take_idx]
+    yte = yte_full[take_idx]
+
+    yhat0 = model.predict(Xte)
+    rmse0, mae0, r20 = evaluate(yte, yhat0)
+
+    print(
+        f"[Fold {fold}/{K}] baseline RMSE={rmse0:.3f}, "
+        f"MAE={mae0:.3f}, R2={r20:.3f}, GPU={used_gpu}, test_n={take}"
+    )
+
+    for sigma in SIGMA_LIST:
+        deltas = []
+        rmses = []
+
+        for rep in range(R):
+            rrng = np.random.default_rng(
+                RANDOM_SEED + fold * 1000 + rep * 10 + int(sigma * 100)
+            )
+
+            Xp = perturb_X_gaussian(Xte, perturb_cols, sigma, rrng)
+            yhat = model.predict(Xp)
+            rmse, _, _ = evaluate(yte, yhat)
+
+            rmses.append(rmse)
+            deltas.append(rmse - rmse0)
+
+        d_mean, d_ci = mean_ci95(deltas)
+        r_mean, r_ci = mean_ci95(rmses)
+
+        rows.append({
+            "fold": fold,
+            "sigma_rel": float(sigma),
+            "test_n": int(take),
+            "baseline_rmse": rmse0,
+            "baseline_mae": mae0,
+            "baseline_r2": r20,
+            "pert_rmse_mean": r_mean,
+            "pert_rmse_ci95": r_ci,
+            "delta_rmse_mean": d_mean,
+            "delta_rmse_ci95": d_ci,
+            "perturb_features": ",".join(PERTURB_FEATURES),
+            "used_gpu": bool(used_gpu),
+        })
+
+df = pd.DataFrame(rows)
+
+csv_path = os.path.join(OUT_DIR, f"{run_tag}.csv")
+json_path = os.path.join(OUT_DIR, f"{run_tag}.json")
+fig_path = os.path.join(OUT_DIR, f"{run_tag}.png")
+
+df.to_csv(csv_path, index=False)
+
+with open(json_path, "w") as f:
+    json.dump(
+        {
+            "npz": NPZ_PATH,
+            "K": K,
+            "N_PER_FOLD": N_PER_FOLD,
+            "R": R,
+            "SIGMA_LIST": SIGMA_LIST,
+            "PERTURB_FEATURES": PERTURB_FEATURES,
+            "DROP_FEATURES": sorted(list(DROP_FEATURES)),
+            "features": channels_final,
+            "n_samples": int(X.shape[0]),
+            "n_features": int(X.shape[1]),
+            "n_cities": int(len(np.unique(city_id))),
+            "results": df.to_dict(orient="records"),
+            "elapsed_sec": float(time.time() - t0),
+        },
+        f,
+        indent=2,
+    )
+
+print("\nSaved:")
+print(csv_path)
+print(json_path)
+
+# ---------------------------
+# 5) Plot
+# ---------------------------
+g = df.groupby("sigma_rel")["delta_rmse_mean"].agg(["mean", "std"]).reset_index()
+g["ci95"] = 1.96 * g["std"] / np.sqrt(K)
+
+plt.figure(figsize=(7, 4.5))
+plt.errorbar(g["sigma_rel"], g["mean"], yerr=g["ci95"], fmt="-o")
+plt.axhline(0, linestyle=":", linewidth=1)
+plt.xlabel("Noise level (sigma as fraction of feature std)")
+plt.ylabel("ΔRMSE on holdout cities")
+plt.title(f"Perturbation robustness, City-GroupKFold K={K}\nFeatures: {', '.join(PERTURB_FEATURES)}")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+plt.show()
+
+print("Saved figure:", fig_path)
+print("Elapsed sec:", round(time.time() - t0, 1))
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr, pearsonr
+
+NPZ_PATH = "/content/drive/MyDrive/anature_revised/multiyear_catboost_npz_with_metadata_fast_WITH_SWVL1_WIND10M_STL1/ALLCITIES_train_xy_MULTIYEAR_2013_2025_fine0.005_S1_maxCM3000_TOP100_WITH_ROWCOL_LOCALFAST_WITH_SWVL1_WIND10M_STL1.npz"
+
+data = np.load(NPZ_PATH, allow_pickle=True)
+
+X = data["X"]
+channels = data["channels"].tolist()
+
+df = pd.DataFrame(X, columns=channels)
+
+EVI = df["EVI.EVI"].values
+LAI = df["LAI.LAI"].values
+
+mask = np.isfinite(EVI) & np.isfinite(LAI)
+
+EVI = EVI[mask]
+LAI = LAI[mask]
+
+# 为了画图速度，只抽样
+N = 100000
+idx = np.random.choice(len(EVI), N, replace=False)
+
+EVI = EVI[idx]
+LAI = LAI[idx]
+
+# 计算相关系数
+r, _ = pearsonr(EVI, LAI)
+rho, _ = spearmanr(EVI, LAI)
+
+plt.figure(figsize=(6,5))
+
+plt.hexbin(EVI, LAI, gridsize=80, cmap="viridis", mincnt=1)
+
+plt.xlabel("EVI")
+plt.ylabel("LAI")
+
+plt.title("Correlation between EVI and LAI")
+
+plt.text(
+    0.02, 0.95,
+    f"Pearson r = {r:.2f}\nSpearman ρ = {rho:.2f}",
+    transform=plt.gca().transAxes,
+    verticalalignment="top",
+    bbox=dict(facecolor="white", alpha=0.8)
+)
+
+plt.colorbar(label="Counts")
+
+plt.tight_layout()
+plt.savefig("EVI_LAI_correlation.png", dpi=300)
+plt.show()
