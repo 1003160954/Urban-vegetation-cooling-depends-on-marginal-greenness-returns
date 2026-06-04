@@ -1,6 +1,6 @@
-# Urban Vegetation Cooling Depends on Marginal Greenness Returns
+# Global nonlinear thresholds and seasonal timing of urban vegetation cooling
 
-This repository contains the main code used for the study **"Urban vegetation cooling depends on marginal greenness returns"**.
+This repository contains the main code used for the study **"Global nonlinear thresholds and seasonal timing of urban vegetation cooling"**.
 
 The workflow combines Google Earth Engine exports, multi-source raster harmonization, CatBoost modelling, model-based perturbation analysis, climate-background analysis, EVI statistical diagnostics, vegetation phenology simulation, EVI-LST time-lag analysis, robustness checks, and observation-based validation.
 
